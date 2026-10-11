@@ -17,6 +17,7 @@ limitations under the License.
 package resources
 
 import (
+	"bytes"
 	"os"
 	"os/exec"
 	"path/filepath"
@@ -105,7 +106,7 @@ func assertImageUvCopied(t *testing.T, e *uvScriptEnv) {
 		t.Fatal(err)
 	}
 	want, _ := os.ReadFile(e.srcUv)
-	if string(got) != string(want) {
+	if !bytes.Equal(got, want) {
 		t.Fatalf("uv content = %q, want the image's uv", got)
 	}
 	if _, err := os.Lstat(e.uvPath() + ".tmp"); !os.IsNotExist(err) {
