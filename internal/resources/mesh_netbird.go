@@ -125,6 +125,9 @@ func (netbirdProvider) SidecarContainers(instance *openclawv1alpha1.OpenClawInst
 		{Name: "NB_DAEMON_ADDR", Value: NetBirdDaemonAddr},
 		{Name: "NB_LOG_FILE", Value: NetBirdLogFile},
 		{Name: "USER", Value: NetBirdUser},
+		// The pod UID has no passwd entry, so HOME would fall back to "/" and
+		// "netbird up" would try to mkdir /.config on the read-only root.
+		{Name: "HOME", Value: NetBirdStateDir},
 		{Name: "NB_HOSTNAME", Value: NetBirdHostname(instance)},
 		// The client is non-interactive in a pod; without this it would block
 		// waiting for a browser-based login instead of using the setup key.
@@ -156,6 +159,9 @@ func (netbirdProvider) SidecarContainers(instance *openclawv1alpha1.OpenClawInst
 		Image:           GetNetBirdImage(instance),
 		ImagePullPolicy: corev1.PullIfNotPresent,
 		Env:             env,
+		// The daemon writes some files relative to its working directory
+		// (e.g. the updater's result.json); keep that on the writable volume.
+		WorkingDir: NetBirdStateDir,
 		VolumeMounts: []corev1.VolumeMount{
 			{
 				// Peer identity and config. An emptyDir means the peer

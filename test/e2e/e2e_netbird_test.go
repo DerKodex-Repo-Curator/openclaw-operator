@@ -20,6 +20,7 @@ import (
 	"fmt"
 	"os"
 	"os/exec"
+	"strings"
 	"time"
 
 	. "github.com/onsi/ginkgo/v2"
@@ -234,6 +235,9 @@ var _ = Describe("NetBird mesh provider", func() {
 			return logs
 		}, 5*time.Minute, 5*time.Second).Should(ContainSubstring("started daemon server"),
 			"the NetBird daemon never reported startup")
-		Expect(logs).NotTo(ContainSubstring("read-only file system"))
+		for _, line := range strings.Split(logs, "\n") {
+			Expect(line).NotTo(ContainSubstring("read-only file system"),
+				"the sidecar must not touch the read-only root filesystem")
+		}
 	})
 })

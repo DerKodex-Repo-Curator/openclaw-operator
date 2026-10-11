@@ -241,6 +241,15 @@ func TestNetBirdSidecar_WritablePathsLiveOnMountedVolume(t *testing.T) {
 	if env["USER"] == "" {
 		t.Error("USER must be set for the NetBird CLI")
 	}
+
+	// With no passwd entry HOME would be "/", and "netbird up" would try to
+	// create /.config on the read-only root filesystem.
+	if !mounted(env["HOME"]) {
+		t.Errorf("HOME = %q is not on a writable volume", env["HOME"])
+	}
+	if !mounted(c.WorkingDir) {
+		t.Errorf("workingDir = %q is not on a writable volume", c.WorkingDir)
+	}
 }
 
 func TestNetBirdSidecar_InjectsSetupKeyFromSecret(t *testing.T) {
