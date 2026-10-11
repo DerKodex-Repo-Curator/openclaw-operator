@@ -1586,6 +1586,11 @@ func buildTmpDirInitContainer(instance *openclawv1alpha1.OpenClawInstance) corev
 	// directory already present.
 	script := fmt.Sprintf("set -e\nmkdir -p /tmp-volume/%[1]s\nchmod 1777 /tmp-volume/%[1]s", MainTmpSubPath)
 
+	// Run as the gateway's effective UID so the directory belongs to the user
+	// that writes to it (and so it matches the other operator init containers;
+	// see #619). Falls back to the pod UID when no container UID is set.
+	mainSC := buildContainerSecurityContext(instance)
+
 	return corev1.Container{
 		Name:                     TmpDirInitContainerName,
 		Image:                    ApplyRegistryOverride("docker.io/library/busybox:1.37", instance.Spec.Registry),
@@ -1597,6 +1602,7 @@ func buildTmpDirInitContainer(instance *openclawv1alpha1.OpenClawInstance) corev
 		SecurityContext: &corev1.SecurityContext{
 			AllowPrivilegeEscalation: Ptr(false),
 			ReadOnlyRootFilesystem:   Ptr(true),
+			RunAsUser:                mainSC.RunAsUser,
 			RunAsNonRoot:             Ptr(true),
 			Capabilities: &corev1.Capabilities{
 				Drop: []corev1.Capability{"ALL"},
