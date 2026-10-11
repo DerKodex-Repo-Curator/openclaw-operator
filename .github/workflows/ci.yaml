@@ -153,6 +153,10 @@ jobs:
 
       - uses: azure/setup-helm@v4
 
+      - uses: actions/setup-node@v4
+        with:
+          node-version: '22'
+
       - name: Run tests
         run: make test
 
