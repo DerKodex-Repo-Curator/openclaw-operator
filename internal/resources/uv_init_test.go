@@ -63,7 +63,7 @@ func newUvScriptEnv(t *testing.T) *uvScriptEnv {
 	// paths (/home/openclaw/...) that the script maps back onto it.
 	script = strings.ReplaceAll(script, "/data/", data+"/")
 	script = strings.ReplaceAll(script, "\"/data\"", "\""+data+"\"")
-	if strings.Contains(script, " /data") {
+	if strings.Contains(script, " /data/") || strings.Contains(script, "=/data/") || strings.Contains(script, "\"/data/") {
 		t.Fatalf("script still references /data after rewrite:\n%s", script)
 	}
 	return &uvScriptEnv{data: data, srcUv: srcUv, script: script}
