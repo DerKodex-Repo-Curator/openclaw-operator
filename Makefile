@@ -54,8 +54,12 @@ vet: ## Run go vet against code.
 	go vet ./...
 
 .PHONY: test
-test: manifests generate fmt vet envtest ## Run tests.
+test: manifests generate fmt vet envtest test-plugin-installer ## Run tests.
 	KUBEBUILDER_ASSETS="$(shell $(ENVTEST) use $(ENVTEST_K8S_VERSION) --bin-dir $(LOCALBIN) -p path)" go test $$(go list ./... | grep -v /e2e) -coverprofile cover.out
+
+.PHONY: test-plugin-installer
+test-plugin-installer: ## Exercise the embedded plugin installer with Node.js 22+.
+	node --test test/installer/*.test.mjs
 
 .PHONY: test-e2e
 test-e2e: ## Run end-to-end tests.
@@ -129,17 +133,22 @@ conformance-gitops: ## Run the GitOps coexistence conformance category.
 conformance-failure: ## Run the failure-modes conformance category.
 	cd test/conformance && go test -v -timeout 20m -ginkgo.v -ginkgo.focus="failure modes" ./...
 
+# Releases signed before the repository moved from paperclipinc to stubbi carry
+# the old workflow identity, later ones the new one; accept both.
+SIGNING_IDENTITY_REGEXP ?= ^https://github.com/(paperclipinc|stubbi)/openclaw-operator/.github/workflows/.*
+IMAGE_NAMESPACE ?= paperclipinc
+
 .PHONY: verify-signing
 verify-signing: ## Verify the latest published release is Cosign-signed and SBOM-attested.
-	@VERSION=$$(gh release view --repo paperclipinc/openclaw-operator --json tagName --jq .tagName); \
-	IMAGE="ghcr.io/paperclipinc/openclaw-operator:$${VERSION}"; \
+	@VERSION=$$(gh release view --repo stubbi/openclaw-operator --json tagName --jq .tagName); \
+	IMAGE="ghcr.io/$(IMAGE_NAMESPACE)/openclaw-operator:$${VERSION}"; \
 	echo "Verifying $${IMAGE}..."; \
 	cosign verify "$${IMAGE}" \
-	  --certificate-identity-regexp 'https://github.com/paperclipinc/openclaw-operator/.github/workflows/.*' \
+	  --certificate-identity-regexp '$(SIGNING_IDENTITY_REGEXP)' \
 	  --certificate-oidc-issuer https://token.actions.githubusercontent.com >/dev/null || { echo "::error::signature verification failed for $${IMAGE}"; exit 1; }; \
 	echo "Verifying SBOM attestation..."; \
 	cosign verify-attestation "$${IMAGE}" --type spdxjson \
-	  --certificate-identity-regexp 'https://github.com/paperclipinc/openclaw-operator/.github/workflows/.*' \
+	  --certificate-identity-regexp '$(SIGNING_IDENTITY_REGEXP)' \
 	  --certificate-oidc-issuer https://token.actions.githubusercontent.com >/dev/null || { echo "::error::SBOM attestation verification failed for $${IMAGE}"; exit 1; }; \
 	echo "OK: $${IMAGE} is signed and SBOM-attested."
 

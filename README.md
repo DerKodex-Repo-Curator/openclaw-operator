@@ -663,13 +663,85 @@ spec:
     - "some-other-plugin"
 ```
 
-Plugin entries are resolved through the OpenClaw CLI's ClawHub installer, not raw `npm install`. An optional `npm:` prefix is accepted for compatibility and stripped before installation, so `npm:@scope/plugin` and `@scope/plugin` both run as `openclaw plugins install clawhub:@scope/plugin`. Use `spec.skills` when you need npm package source selection for skills.
+Plugin entries without a prefix are resolved through the OpenClaw CLI’s ClawHub installer. An explicit `npm:` prefix selects the CLI’s npm resolver. Both paths accept exact versions, for example `npm:@scope/plugin@1.2.3`; neither lets the instance manifest enforce an expected artifact hash.
 
 This is the layout the OpenClaw gateway's plugin discovery expects - it scans direct subdirectories of `~/.openclaw/extensions/` for plugin manifests and skips `node_modules/` entirely. The init container shells out to `openclaw plugins install clawhub:<pkg>` so plugins published with `workspace:*` dependency markers, such as the first-party `@openclaw/matrix`, resolve correctly. Raw `npm install` rejects those with `EUNSUPPORTEDPROTOCOL`.
 
 npm lifecycle scripts are disabled globally on the init container (`NPM_CONFIG_IGNORE_SCRIPTS=true`) to mitigate supply chain attacks. The PVC backs `~/.openclaw/`, so installs persist across pod restarts.
 
 > If you previously worked around the install-path bug by adding `plugins.load.paths` entries to your gateway config (pointing at `~/.openclaw/node_modules/<pkg>`), that workaround is no longer needed and can be removed - plugins now land in the documented location and are auto-discovered.
+
+#### Verified plugin installation
+
+Use `spec.verifiedPlugins` to commit an exact public npm version and its reviewed SHA-512 SRI digest together:
+
+```yaml
+spec:
+  verifiedPlugins:
+    - package: "@openclaw/brave-plugin"
+      version: "2026.9.1"
+      integrity: "sha512-4+j+eQTToV3k7Cb25MUL6h2uL8cJYyuLytfpd/sJK/HjR43dgKBqKpBsb1+I3w1Jr6PLpnjSf6/I3//3K0cdnA=="
+      acceptCapabilities: true
+```
+
+This is an alternative to `spec.plugins`; the two nonempty lists cannot be combined. Third-party scoped and unscoped npm packages are supported. Versions must be exact SemVer, including optional prerelease/build identifiers; tags and ranges are rejected. Packages sharing an unscoped basename are rejected to avoid collisions on runtimes that use package basenames as installation directories.
+
+The operator uses the instance's runtime image and existing plugin storage/CA settings. Before passing an archive to `openclaw plugins install --force npm-pack:<archive>`, it checks the registry's package name, version, and `dist.integrity`, then hashes the downloaded bytes against the committed digest. Verification failures stop the init container and prevent gateway startup. Each download rejects redirects, has a 60-second deadline, and is limited to 1 MiB for metadata or 32 MiB for archives. CLI installation has a five-minute deadline. Archives are removed after successful or failed CLI execution. A failed multi-plugin installation may leave earlier plugins installed; a restart verifies and reinstalls every entry.
+
+Like `spec.plugins`, this list requests installations; it is not an exclusive runtime allowlist. Removing an entry does not uninstall its persisted files or revoke its capability consent, and removing the final entry omits the plugin init container. Previously installed plugins may still load according to OpenClaw's configuration and discovery rules. Switching from `spec.plugins` to `spec.verifiedPlugins` does not verify or remove other plugins already present on the PVC. Manage disabling or uninstalling those plugins separately; automatic removal and ownership tracking are outside this feature.
+
+`acceptCapabilities` defaults to false. Setting it to true passes `--accept-capabilities` only after verification. Review the pinned plugin's declared capabilities before setting consent and whenever updating its version or digest. `--force` acknowledges source trust and permits replacement; it does not substitute for capability consent. A plugin requiring consent fails noninteractively when consent is absent.
+
+Provision the PVC state directory with ownership matching the runtime UID. OpenClaw 2026.9.4 tightens state-directory permissions during installation, so group write access alone to a root-owned directory is insufficient; this requirement also affects legacy plugin installs.
+
+Use an OpenClaw image that supports `npm-pack:` and `--accept-capabilities`; older images fail installation rather than falling back to an unverified resolver. The example pins are installation inputs, not a claim that every runtime version is compatible. Pin and test your runtime image alongside plugin updates. Version, digest, or consent changes trigger a pod rollout.
+
+The initial implementation supports `https://registry.npmjs.org` with same-origin tarballs and no redirects. Private registries, authenticated downloads, and ClawHub artifact verification are outside this path. Integrity covers the reviewed package archive, not transitive dependencies fetched by OpenClaw or later changes to installed files on the PVC. Capability consent is not a runtime sandbox. npm lifecycle scripts remain disabled.
+
+Obtain candidate metadata with `npm view <package>@<exact-version> dist.integrity`, review the artifact and capabilities, and commit version/digest changes together. The installer never replaces the committed digest with a newly discovered value. See [installer tests](test/installer/README.md) for reproducible failure cases and real-image compatibility testing.
+
+### Plugin installer controls
+
+`spec.pluginInstall` applies to both `spec.plugins` and `spec.verifiedPlugins`.
+Its resources support requests and limits; resource claims are rejected during
+API validation because the operator does not provision pod resource claims.
+Defaults preserve the existing installer behavior. To keep runtime environment
+secrets out of the installer, bound its resources, and use a read-only image:
+
+```yaml
+spec:
+  pluginInstall:
+    inheritEnv: false
+    readOnlyRootFilesystem: true
+    resources:
+      requests:
+        cpu: 25m
+        memory: 256Mi
+        ephemeral-storage: 64Mi
+      limits:
+        memory: 1Gi
+        ephemeral-storage: 128Mi
+```
+
+`inheritEnv: false` excludes both `spec.env` and `spec.envFrom` from the installer;
+it does not change the gateway environment. The operator still supplies HOME,
+npm paths, lifecycle-script suppression, and a configured CA bundle. This is
+environment isolation, not a sandbox: the installer still mounts persistent
+OpenClaw state and uses the pod network.
+
+The installer and scratch initializer use the gateway's effective UID for file
+ownership, but retain the pod-level `runAsNonRoot` policy. A gateway-only
+`containerSecurityContext.runAsNonRoot` override does not change that policy.
+
+Read-only mode adds `init-plugin-scratch`, using the same runtime image and
+resource limits, without runtime environment variables. It creates a directory
+owned by the installer UID with mode `0700` inside an emptyDir; only that
+subdirectory is mounted at `/tmp` in `init-plugins`. Mounting the entire emptyDir
+would expose its fsGroup-adjusted `2777` root, which newer OpenClaw versions
+reject. The scratch volume is bounded by the configured ephemeral-storage limit
+(or `128Mi` if unset) and disappears with the pod. npm prefix/cache and plugin
+state remain writable on the data PVC. Custom runtime images or plugins may
+require additional writable paths; validate them before enabling read-only mode.
 
 ### Workspace seeding
 
@@ -933,7 +1005,17 @@ Kubernetes applies `fsGroup` to the root of a volume but never changes its owner
 
 The operator therefore runs an `init-data-owner` init container first on every pod start. It runs as root with every capability dropped except `CHOWN`, changes the owner of the volume root to the gateway's effective UID and the pod's `runAsGroup` when it differs, and exits without touching anything when ownership is already correct. The effective UID uses `security.containerSecurityContext.runAsUser` when set, otherwise the pod UID. Operator-managed init containers that write to the data volume use the same UID override, so they can access the directory after the gateway tightens its permissions. The ownership helper does not modify existing children; changing the runtime UID of an existing installation may require an out-of-band migration of those files. User-defined init containers retain their configured identities.
 
-If your cluster forbids root init containers (for example the `restricted` Pod Security Standard), disable it and fix ownership out of band once per PVC:
+Namespaces that enforce the `restricted` Pod Security Standard (`pod-security.kubernetes.io/enforce: restricted`) reject root init containers at admission. The operator detects that label and leaves `init-data-owner` out there automatically, so upgrading the operator never blocks pods in a restricted namespace. In those namespaces fix ownership out of band once per PVC (for example with a one-off Job in a namespace that permits it, or through your storage provisioner) before moving to OpenClaw 2026.9 or later.
+
+To detect the label the operator needs `get` on `namespaces` (granted by the Helm chart, the OLM bundle, and `config/rbac`). If it cannot read the instance's Namespace, it does not guess: reconciliation fails with a `ReconcileFailed` event naming the missing permission and is retried, without changing the existing StatefulSet. Setting `spec.storage.fixOwnership` explicitly skips the lookup.
+
+`spec.storage.fixOwnership` overrides the automatic behavior:
+
+| Value | Behavior |
+|-------|----------|
+| unset (default) | Run `init-data-owner`, except in namespaces that enforce the `restricted` Pod Security Standard |
+| `true` | Always run it (use when the namespace is exempted from Pod Security Admission some other way) |
+| `false` | Never run it (use when another admission policy forbids root init containers) |
 
 ```yaml
 spec:
@@ -1084,7 +1166,7 @@ The operator builds a single `PathPrefix: /` rule routing to the instance Servic
 
 ### Custom service ports
 
-By default the operator creates a Service with the gateway (18789) and canvas (18793) ports. To expose custom ports instead (e.g., for a non-default application), set `spec.networking.service.ports`:
+By default the operator creates a Service with the gateway (18789) and canvas (18793) ports, plus the MCP Apps sandbox (18795) port when MCP Apps is enabled (see below). To expose custom ports instead (e.g., for a non-default application), set `spec.networking.service.ports`:
 
 ```yaml
 spec:
@@ -1098,6 +1180,27 @@ spec:
 ```
 
 When `ports` is set, it fully replaces the default ports -- including the Chromium port if the sidecar is enabled. To keep the defaults alongside custom ports, include them explicitly. If `targetPort` is omitted it defaults to `port`. See the [API reference](docs/api-reference.md#specnetworkingservice) for all fields.
+
+### MCP Apps sandbox
+
+OpenClaw's [MCP Apps](https://docs.openclaw.ai/cli/mcp/apps) and script-enabled dashboard widgets are served from a separate sandbox listener. Upstream defaults that listener to the gateway port plus one (18790) on loopback, which inside an operator-managed pod is the port the gateway proxy sidecar already listens on. The operator therefore handles the sandbox like the gateway and canvas ports:
+
+- When `mcp.apps.enabled` is `true` in your OpenClaw config and `mcp.apps.sandboxPort` is not set, the operator sets `mcp.apps.sandboxPort` to `18795`. A port you set yourself wins.
+- With the gateway proxy enabled (the default), the proxy sidecar forwards pod port `18796` to the loopback sandbox listener. With `spec.gateway.enabled: false` the Service targets the sandbox listener port directly.
+- The Service exposes port `18795` (named `mcp-apps`), and the NetworkPolicy allows ingress to it under the same rules as the gateway and canvas ports.
+- These ports are only added when MCP Apps is enabled in `spec.config.raw`, so instances that do not use MCP Apps keep their pod template, Service and NetworkPolicy unchanged. The operator cannot see the effective config when it comes from `spec.config.configMapRef` or when `mergeMode: merge` lets runtime changes on the PVC enable MCP Apps, so in those cases the sandbox ports are always added.
+
+```yaml
+spec:
+  config:
+    raw:
+      mcp:
+        apps:
+          enabled: true
+          sandboxOrigin: "https://apps.openclaw.example.com"
+```
+
+OpenClaw requires the sandbox origin to differ from the Control UI origin, so give it a dedicated hostname and route only that hostname to Service port `18795` with your own Ingress or HTTPRoute. If you set `mcp.apps.sandboxPort` yourself, the proxy, the Service and the NetworkPolicy follow it. One exception: with `spec.config.configMapRef` and the gateway proxy disabled, the operator cannot read your port and the Service targets `18795`, so keep the default there. With `spec.networking.service.ports` set, add the `mcp-apps` port (target port `18796`, or your sandbox port when the proxy is disabled) to your list explicitly.
 
 ### CA bundle injection
 
@@ -1234,7 +1337,7 @@ The operator follows a **secure-by-default** philosophy. Every instance ships wi
 ### Defaults
 
 - **Non-root execution**: containers run as UID 1000; root (UID 0) is blocked by the validating webhook (exception: Ollama sidecar requires root per the official image)
-- **Read-only root filesystem**: enabled by default for the main container and the Chromium sidecar; the PVC at `~/.openclaw/` provides writable home, and a `/tmp` emptyDir handles temp files
+- **Read-only root filesystem**: enabled by default for the main container and the Chromium sidecar; the PVC at `~/.openclaw/` provides writable home, and a `/tmp` emptyDir handles temp files. The `init-tmp-dir` init container gives that `/tmp` the sticky bit (mode `1777`), which OpenClaw 2026.9.6 and later require before they create temporary workspaces; the root of an emptyDir is `2777` under `fsGroup` and cannot be changed from the pod spec
 - **All capabilities dropped**: no ambient Linux capabilities
 - **Seccomp RuntimeDefault**: syscall filtering enabled
 - **Default-deny NetworkPolicy**: DNS (53) and HTTPS (443) egress allowed by default; set `security.networkPolicy.allowHTTPS: false` and use `additionalEgress` to restrict HTTPS destinations (see [Network Isolation](docs/architecture.md#network-isolation)). Ingress is limited to the same namespace. Metrics ingress is a separate rule that can be restricted independently -- see [Restricting who can scrape metrics](#restricting-who-can-scrape-metrics)

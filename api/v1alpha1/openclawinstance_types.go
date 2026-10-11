@@ -8,6 +8,7 @@ import (
 )
 
 // OpenClawInstanceSpec defines the desired state of OpenClawInstance
+// +kubebuilder:validation:XValidation:rule="!has(self.plugins) || size(self.plugins) == 0 || !has(self.verifiedPlugins) || size(self.verifiedPlugins) == 0",message="plugins and verifiedPlugins are mutually exclusive"
 type OpenClawInstanceSpec struct {
 	// Registry is the global container image registry override.
 	// When set, this registry replaces the registry part of all container images
@@ -62,15 +63,31 @@ type OpenClawInstanceSpec struct {
 
 	// Plugins is a list of plugins to install via init container.
 	// Each entry is an npm package name (e.g., "@openclaw/matrix" or
-	// "@martian-engineering/lossless-claw"). An optional "npm:" prefix is
-	// accepted and stripped before installation.
-	// Installation goes through the OpenClaw CLI's ClawHub installer
+	// "@martian-engineering/lossless-claw"). An optional "npm:" prefix
+	// selects the npm resolver; entries without a prefix use ClawHub.
+	// Installation goes through the OpenClaw CLI's installer
 	// ("openclaw plugins install clawhub:<pkg>") rather than raw npm install
 	// so packages published with workspace:* dependency markers resolve
 	// correctly. npm lifecycle scripts are disabled for security.
 	// +kubebuilder:validation:MaxItems=20
 	// +optional
 	Plugins []string `json:"plugins,omitempty"`
+
+	// VerifiedPlugins installs exact public npm artifacts after checking registry
+	// metadata and downloaded bytes against a committed SHA-512 integrity value.
+	// Mutually exclusive with Plugins. Requires an OpenClaw image supporting
+	// npm-pack: installs and --accept-capabilities. Changes trigger a pod rollout.
+	// Install-only: removing entries does not uninstall persisted plugins or
+	// revoke consent. This is not an exclusive runtime plugin allowlist.
+	// +kubebuilder:validation:MaxItems=20
+	// +listType=map
+	// +listMapKey=package
+	// +optional
+	VerifiedPlugins []VerifiedPluginSpec `json:"verifiedPlugins,omitempty"`
+
+	// PluginInstall configures the managed plugin installer.
+	// +optional
+	PluginInstall *PluginInstallSpec `json:"pluginInstall,omitempty"`
 
 	// EnvFrom is a list of sources to populate environment variables from
 	// Use this for API keys and other secrets (e.g., ANTHROPIC_API_KEY, OPENAI_API_KEY)
@@ -729,10 +746,15 @@ type StorageSpec struct {
 	// modes on that path when it writes config and fails with
 	// "EPERM: operation not permitted, fchmod" if the directory is not owned by
 	// the gateway UID. The init container runs as root with only CAP_CHOWN and
-	// exits immediately when ownership is already correct. Set to false on
-	// clusters that forbid root init containers (e.g. the "restricted" Pod
-	// Security Standard) and fix ownership out of band instead.
-	// +kubebuilder:default=true
+	// exits immediately when ownership is already correct.
+	//
+	// When unset, the init container runs unless the instance's namespace
+	// enforces the "restricted" Pod Security Standard
+	// (pod-security.kubernetes.io/enforce=restricted), which would reject a
+	// root init container at admission. In such namespaces fix ownership out
+	// of band instead. Set to true to always run it, or false to never run it.
+	// Resolving the unset default requires the operator to read the Namespace;
+	// if that read fails, reconciliation is retried without changing workloads.
 	// +optional
 	FixOwnership *bool `json:"fixOwnership,omitempty"`
 }
