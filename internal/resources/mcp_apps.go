@@ -58,7 +58,7 @@ func ResolveMcpAppsSandbox(instance *openclawv1alpha1.OpenClawInstance) McpAppsS
 
 // mcpAppsFromRawConfig reports mcp.apps.enabled and mcp.apps.sandboxPort
 // (0 when unset or not a valid port) from the inline config.
-func mcpAppsFromRawConfig(instance *openclawv1alpha1.OpenClawInstance) (bool, int32) {
+func mcpAppsFromRawConfig(instance *openclawv1alpha1.OpenClawInstance) (enabled bool, port int32) {
 	if instance.Spec.Config.Raw == nil || len(instance.Spec.Config.Raw.Raw) == 0 {
 		return false, 0
 	}
@@ -71,7 +71,7 @@ func mcpAppsFromRawConfig(instance *openclawv1alpha1.OpenClawInstance) (bool, in
 
 // mcpAppsSettings extracts mcp.apps.enabled and mcp.apps.sandboxPort from a
 // parsed OpenClaw config.
-func mcpAppsSettings(config map[string]interface{}) (bool, int32) {
+func mcpAppsSettings(config map[string]interface{}) (enabled bool, port int32) {
 	mcp, _ := config["mcp"].(map[string]interface{})
 	if mcp == nil {
 		return false, 0
@@ -80,8 +80,7 @@ func mcpAppsSettings(config map[string]interface{}) (bool, int32) {
 	if apps == nil {
 		return false, 0
 	}
-	enabled, _ := apps["enabled"].(bool)
-	var port int32
+	enabled, _ = apps["enabled"].(bool)
 	if p, ok := apps["sandboxPort"].(float64); ok && p >= 1 && p <= 65535 && p == float64(int32(p)) {
 		port = int32(p)
 	}
