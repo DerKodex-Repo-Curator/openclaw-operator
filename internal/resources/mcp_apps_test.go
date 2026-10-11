@@ -22,6 +22,7 @@ import (
 	"strings"
 	"testing"
 
+	corev1 "k8s.io/api/core/v1"
 	"k8s.io/apimachinery/pkg/runtime"
 
 	openclawv1alpha1 "github.com/paperclipinc/openclaw-operator/api/v1alpha1"
@@ -81,7 +82,8 @@ func TestBuildConfigMap_McpAppsSandboxPort(t *testing.T) {
 		{name: "apps disabled is not modified", raw: `{"mcp":{"apps":{"enabled":false}}}`, wantApps: true},
 		{name: "apps enabled gets the operator port", raw: `{"mcp":{"apps":{"enabled":true}}}`, wantApps: true, wantPort: float64(McpAppsSandboxPort)},
 		{name: "user port wins", raw: `{"mcp":{"apps":{"enabled":true,"sandboxPort":19001}}}`, wantApps: true, wantPort: float64(19001)},
-		{name: "proxy disabled keeps the OpenClaw default", raw: `{"mcp":{"apps":{"enabled":true}}}`, proxyDisabled: true, wantApps: true},
+		{name: "proxy disabled still pins the operator port", raw: `{"mcp":{"apps":{"enabled":true}}}`, proxyDisabled: true, wantApps: true, wantPort: float64(McpAppsSandboxPort)},
+		{name: "proxy disabled keeps the user port", raw: `{"mcp":{"apps":{"enabled":true,"sandboxPort":19001}}}`, proxyDisabled: true, wantApps: true, wantPort: float64(19001)},
 	} {
 		t.Run(tt.name, func(t *testing.T) {
 			instance := newTestInstance("mcp-apps")
@@ -113,58 +115,203 @@ func TestBuildConfigMap_McpAppsSandboxPort(t *testing.T) {
 	}
 }
 
-func TestNginxStreamConfig_ProxiesMcpAppsSandbox(t *testing.T) {
-	conf := nginxStreamConfig()
+func withRawConfig(instance *openclawv1alpha1.OpenClawInstance, raw string) *openclawv1alpha1.OpenClawInstance {
+	instance.Spec.Config.Raw = &openclawv1alpha1.RawConfig{
+		RawExtension: runtime.RawExtension{Raw: []byte(raw)},
+	}
+	return instance
+}
+
+const (
+	mcpAppsEnabledRaw  = `{"mcp":{"apps":{"enabled":true}}}`
+	mcpAppsUserPortRaw = `{"mcp":{"apps":{"enabled":true,"sandboxPort":19001}}}`
+)
+
+// nginxSandboxBlock returns the server block that listens on the sandbox proxy
+// port, or "" when there is none.
+func nginxSandboxBlock(conf string) string {
 	listen := fmt.Sprintf("listen 0.0.0.0:%d;", McpAppsSandboxProxyPort)
-	pass := fmt.Sprintf("proxy_pass 127.0.0.1:%d;", McpAppsSandboxPort)
 	i := strings.Index(conf, listen)
 	if i < 0 {
-		t.Fatalf("nginx config does not listen on the sandbox proxy port:\n%s", conf)
+		return ""
 	}
-	// The proxy_pass must belong to the same server block as the listen line.
 	block := conf[i:]
 	if end := strings.Index(block, "}"); end >= 0 {
 		block = block[:end]
 	}
-	if !strings.Contains(block, pass) {
+	return block
+}
+
+func TestResolveMcpAppsSandbox(t *testing.T) {
+	for _, tt := range []struct {
+		name        string
+		raw         string
+		configMap   bool
+		merge       bool
+		wantExposed bool
+		wantPort    int32
+	}{
+		{name: "no config", wantPort: McpAppsSandboxPort},
+		{name: "apps not configured", raw: `{"gateway":{}}`, wantPort: McpAppsSandboxPort},
+		{name: "apps disabled", raw: `{"mcp":{"apps":{"enabled":false}}}`, wantPort: McpAppsSandboxPort},
+		{name: "apps enabled", raw: mcpAppsEnabledRaw, wantExposed: true, wantPort: McpAppsSandboxPort},
+		{name: "apps enabled with user port", raw: mcpAppsUserPortRaw, wantExposed: true, wantPort: 19001},
+		{name: "invalid user port falls back", raw: `{"mcp":{"apps":{"enabled":true,"sandboxPort":70000}}}`, wantExposed: true, wantPort: McpAppsSandboxPort},
+		{name: "configMapRef cannot be inspected", configMap: true, wantExposed: true, wantPort: McpAppsSandboxPort},
+		{name: "mergeMode=merge may enable apps at runtime", raw: `{}`, merge: true, wantExposed: true, wantPort: McpAppsSandboxPort},
+	} {
+		t.Run(tt.name, func(t *testing.T) {
+			instance := newTestInstance("mcp-apps-resolve")
+			if tt.raw != "" {
+				withRawConfig(instance, tt.raw)
+			}
+			if tt.configMap {
+				instance.Spec.Config.ConfigMapRef = &openclawv1alpha1.ConfigMapKeySelector{Name: "external"}
+			}
+			if tt.merge {
+				instance.Spec.Config.MergeMode = ConfigMergeModeMerge
+			}
+			got := ResolveMcpAppsSandbox(instance)
+			if got.Exposed != tt.wantExposed || got.ListenPort != tt.wantPort {
+				t.Errorf("ResolveMcpAppsSandbox() = %+v, want exposed=%v port=%d", got, tt.wantExposed, tt.wantPort)
+			}
+		})
+	}
+}
+
+func TestNginxStreamConfig_McpAppsSandbox(t *testing.T) {
+	if block := nginxSandboxBlock(nginxStreamConfig(0)); block != "" {
+		t.Errorf("sandbox server block rendered without an upstream:\n%s", block)
+	}
+
+	block := nginxSandboxBlock(nginxStreamConfig(McpAppsSandboxPort))
+	if block == "" {
+		t.Fatal("nginx config does not listen on the sandbox proxy port")
+	}
+	if pass := fmt.Sprintf("proxy_pass 127.0.0.1:%d;", McpAppsSandboxPort); !strings.Contains(block, pass) {
 		t.Errorf("sandbox proxy server block does not forward to %d:\n%s", McpAppsSandboxPort, block)
 	}
 }
 
-func TestBuildStatefulSet_McpAppsContainerPorts(t *testing.T) {
-	instance := newTestInstance("mcp-apps-sts")
-	sts := BuildStatefulSet(instance, "", nil, nil, nil)
+func TestBuildConfigMap_NginxMcpAppsUpstream(t *testing.T) {
+	for _, tt := range []struct {
+		name         string
+		raw          string
+		wantUpstream int32 // 0 means no sandbox server block
+	}{
+		{name: "apps not enabled", raw: `{}`},
+		{name: "apps enabled", raw: mcpAppsEnabledRaw, wantUpstream: McpAppsSandboxPort},
+		{name: "user port", raw: mcpAppsUserPortRaw, wantUpstream: 19001},
+	} {
+		t.Run(tt.name, func(t *testing.T) {
+			instance := withRawConfig(newTestInstance("mcp-apps-nginx"), tt.raw)
+			block := nginxSandboxBlock(BuildConfigMap(instance, "", nil).Data[NginxConfigKey])
+			if tt.wantUpstream == 0 {
+				if block != "" {
+					t.Errorf("unexpected sandbox server block:\n%s", block)
+				}
+				return
+			}
+			if pass := fmt.Sprintf("proxy_pass 127.0.0.1:%d;", tt.wantUpstream); !strings.Contains(block, pass) {
+				t.Errorf("sandbox server block does not forward to %d:\n%s", tt.wantUpstream, block)
+			}
+		})
+	}
 
-	var main, proxy bool
-	for _, c := range sts.Spec.Template.Spec.Containers {
-		switch c.Name {
-		case "openclaw":
-			main = true
-			assertContainerPort(t, c.Ports, "mcp-apps", McpAppsSandboxPort)
-		case "gateway-proxy":
-			proxy = true
-			assertContainerPort(t, c.Ports, "mcp-apps-proxy", McpAppsSandboxProxyPort)
+	// A port set in an external (configMapRef) config is honored by nginx.
+	instance := newTestInstance("mcp-apps-nginx-cmref")
+	instance.Spec.Config.ConfigMapRef = &openclawv1alpha1.ConfigMapKeySelector{Name: "external"}
+	cm := BuildConfigMapFromBytes(instance, []byte(mcpAppsUserPortRaw), "", nil)
+	if pass := "proxy_pass 127.0.0.1:19001;"; !strings.Contains(nginxSandboxBlock(cm.Data[NginxConfigKey]), pass) {
+		t.Errorf("configMapRef sandbox port not used as nginx upstream:\n%s", cm.Data[NginxConfigKey])
+	}
+}
+
+func containerByName(t *testing.T, instance *openclawv1alpha1.OpenClawInstance, name string) *corev1.Container {
+	t.Helper()
+	sts := BuildStatefulSet(instance, "", nil, nil, nil)
+	for i := range sts.Spec.Template.Spec.Containers {
+		if sts.Spec.Template.Spec.Containers[i].Name == name {
+			return &sts.Spec.Template.Spec.Containers[i]
 		}
 	}
-	if !main || !proxy {
-		t.Fatalf("expected openclaw and gateway-proxy containers, got main=%v proxy=%v", main, proxy)
+	return nil
+}
+
+func hasContainerPortNamed(ports []corev1.ContainerPort, name string) bool {
+	for _, p := range ports {
+		if p.Name == name {
+			return true
+		}
+	}
+	return false
+}
+
+func TestBuildStatefulSet_McpAppsContainerPorts(t *testing.T) {
+	instance := withRawConfig(newTestInstance("mcp-apps-sts"), mcpAppsEnabledRaw)
+	main := containerByName(t, instance, "openclaw")
+	proxy := containerByName(t, instance, "gateway-proxy")
+	if main == nil || proxy == nil {
+		t.Fatalf("expected openclaw and gateway-proxy containers")
+	}
+	assertContainerPort(t, main.Ports, "mcp-apps", McpAppsSandboxPort)
+	assertContainerPort(t, proxy.Ports, "mcp-apps-proxy", McpAppsSandboxProxyPort)
+
+	// User port is declared on the main container.
+	withRawConfig(instance, mcpAppsUserPortRaw)
+	assertContainerPort(t, containerByName(t, instance, "openclaw").Ports, "mcp-apps", 19001)
+}
+
+func TestBuildStatefulSet_McpAppsDisabledAddsNoPorts(t *testing.T) {
+	instance := newTestInstance("mcp-apps-sts-off")
+	if hasContainerPortNamed(containerByName(t, instance, "openclaw").Ports, "mcp-apps") {
+		t.Error("main container declares mcp-apps without MCP Apps enabled")
+	}
+	if hasContainerPortNamed(containerByName(t, instance, "gateway-proxy").Ports, "mcp-apps-proxy") {
+		t.Error("proxy container declares mcp-apps-proxy without MCP Apps enabled")
 	}
 }
 
 func TestBuildService_McpAppsPort(t *testing.T) {
-	instance := newTestInstance("mcp-apps-svc")
-	svc := BuildService(instance)
-	assertServicePortWithTarget(t, svc.Spec.Ports, "mcp-apps", int32(McpAppsSandboxPort), int32(McpAppsSandboxProxyPort))
+	instance := withRawConfig(newTestInstance("mcp-apps-svc"), mcpAppsEnabledRaw)
+	assertServicePortWithTarget(t, BuildService(instance).Spec.Ports, "mcp-apps", int32(McpAppsSandboxPort), int32(McpAppsSandboxProxyPort))
 
+	// Proxy disabled: target the listener directly (review on #617).
 	instance.Spec.Gateway.Enabled = Ptr(false)
-	svc = BuildService(instance)
-	assertServicePortWithTarget(t, svc.Spec.Ports, "mcp-apps", int32(McpAppsSandboxPort), int32(McpAppsSandboxPort))
+	assertServicePortWithTarget(t, BuildService(instance).Spec.Ports, "mcp-apps", int32(McpAppsSandboxPort), int32(McpAppsSandboxPort))
+
+	// Proxy disabled with a user port: target the user port.
+	withRawConfig(instance, mcpAppsUserPortRaw)
+	assertServicePortWithTarget(t, BuildService(instance).Spec.Ports, "mcp-apps", int32(McpAppsSandboxPort), 19001)
+
+	// Proxy enabled with a user port: still through nginx.
+	instance.Spec.Gateway.Enabled = nil
+	assertServicePortWithTarget(t, BuildService(instance).Spec.Ports, "mcp-apps", int32(McpAppsSandboxPort), int32(McpAppsSandboxProxyPort))
+}
+
+func TestBuildService_McpAppsDisabledAddsNoPort(t *testing.T) {
+	for _, p := range BuildService(newTestInstance("mcp-apps-svc-off")).Spec.Ports {
+		if p.Name == "mcp-apps" {
+			t.Fatalf("Service has an mcp-apps port without MCP Apps enabled: %+v", p)
+		}
+	}
 }
 
 func TestBuildNetworkPolicy_McpAppsIngressPort(t *testing.T) {
-	instance := newTestInstance("mcp-apps-np")
+	instance := withRawConfig(newTestInstance("mcp-apps-np"), mcpAppsEnabledRaw)
 	assertNPPort(t, networkPolicyIngressPorts(instance), McpAppsSandboxProxyPort)
 
 	instance.Spec.Gateway.Enabled = Ptr(false)
 	assertNPPort(t, networkPolicyIngressPorts(instance), McpAppsSandboxPort)
+
+	withRawConfig(instance, mcpAppsUserPortRaw)
+	assertNPPort(t, networkPolicyIngressPorts(instance), 19001)
+}
+
+func TestBuildNetworkPolicy_McpAppsDisabledAddsNoPort(t *testing.T) {
+	for _, p := range networkPolicyIngressPorts(newTestInstance("mcp-apps-np-off")) {
+		if p.Port != nil && (p.Port.IntValue() == McpAppsSandboxProxyPort || p.Port.IntValue() == McpAppsSandboxPort) {
+			t.Fatalf("NetworkPolicy allows the sandbox port without MCP Apps enabled: %+v", p)
+		}
+	}
 }

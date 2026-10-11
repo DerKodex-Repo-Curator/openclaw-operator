@@ -85,11 +85,9 @@ func buildServicePorts(instance *openclawv1alpha1.OpenClawInstance) []corev1.Ser
 	// When disabled, target the gateway and canvas ports directly.
 	gwTarget := int32(GatewayProxyPort)
 	canvasTarget := int32(CanvasProxyPort)
-	mcpAppsTarget := int32(McpAppsSandboxProxyPort)
 	if !IsGatewayProxyEnabled(instance) {
 		gwTarget = int32(GatewayPort)
 		canvasTarget = int32(CanvasPort)
-		mcpAppsTarget = int32(McpAppsSandboxPort)
 	}
 
 	ports := []corev1.ServicePort{
@@ -105,14 +103,21 @@ func buildServicePorts(instance *openclawv1alpha1.OpenClawInstance) []corev1.Ser
 			TargetPort: intstr.FromInt32(canvasTarget),
 			Protocol:   corev1.ProtocolTCP,
 		},
-		// MCP Apps sandbox listener (#615). Only reachable when
-		// mcp.apps.enabled is set in the OpenClaw config.
-		{
+	}
+
+	// MCP Apps sandbox listener (#615). Through the proxy sidecar when it is
+	// enabled, otherwise straight to the listener's effective port.
+	if sandbox := ResolveMcpAppsSandbox(instance); sandbox.Exposed {
+		mcpAppsTarget := int32(McpAppsSandboxProxyPort)
+		if !IsGatewayProxyEnabled(instance) {
+			mcpAppsTarget = sandbox.ListenPort
+		}
+		ports = append(ports, corev1.ServicePort{
 			Name:       "mcp-apps",
 			Port:       int32(McpAppsSandboxPort),
 			TargetPort: intstr.FromInt32(mcpAppsTarget),
 			Protocol:   corev1.ProtocolTCP,
-		},
+		})
 	}
 
 	if instance.Spec.Chromium.Enabled {

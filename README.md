@@ -130,7 +130,7 @@ Every request is validated against the instance's allowlist policy. Protected co
 |  |                     Tailscale (opt) + custom sidecars      | |
 |  +------------------------------------------------------------+ |
 |                                                                 |
-|  Service (default: 18789, 18793, 18795 or custom) -> Ingress    |
+|  Service (default: 18789, 18793 or custom) -> Ingress (opt)     |
 +-----------------------------------------------------------------+
 ```
 
@@ -1084,7 +1084,7 @@ The operator builds a single `PathPrefix: /` rule routing to the instance Servic
 
 ### Custom service ports
 
-By default the operator creates a Service with the gateway (18789), canvas (18793) and MCP Apps sandbox (18795) ports. To expose custom ports instead (e.g., for a non-default application), set `spec.networking.service.ports`:
+By default the operator creates a Service with the gateway (18789) and canvas (18793) ports, plus the MCP Apps sandbox (18795) port when MCP Apps is enabled (see below). To expose custom ports instead (e.g., for a non-default application), set `spec.networking.service.ports`:
 
 ```yaml
 spec:
@@ -1103,9 +1103,10 @@ When `ports` is set, it fully replaces the default ports -- including the Chromi
 
 OpenClaw's [MCP Apps](https://docs.openclaw.ai/cli/mcp/apps) and script-enabled dashboard widgets are served from a separate sandbox listener. Upstream defaults that listener to the gateway port plus one (18790) on loopback, which inside an operator-managed pod is the port the gateway proxy sidecar already listens on. The operator therefore handles the sandbox like the gateway and canvas ports:
 
-- When `mcp.apps.enabled` is `true` in your OpenClaw config and `mcp.apps.sandboxPort` is not set, the operator sets `mcp.apps.sandboxPort` to `18795`.
-- The gateway proxy sidecar forwards pod port `18796` to the loopback listener on `18795`.
+- When `mcp.apps.enabled` is `true` in your OpenClaw config and `mcp.apps.sandboxPort` is not set, the operator sets `mcp.apps.sandboxPort` to `18795`. A port you set yourself wins.
+- With the gateway proxy enabled (the default), the proxy sidecar forwards pod port `18796` to the loopback sandbox listener. With `spec.gateway.enabled: false` the Service targets the sandbox listener port directly.
 - The Service exposes port `18795` (named `mcp-apps`), and the NetworkPolicy allows ingress to it under the same rules as the gateway and canvas ports.
+- These ports are only added when MCP Apps is enabled in `spec.config.raw`, so instances that do not use MCP Apps keep their pod template, Service and NetworkPolicy unchanged. The operator cannot see the effective config when it comes from `spec.config.configMapRef` or when `mergeMode: merge` lets runtime changes on the PVC enable MCP Apps, so in those cases the sandbox ports are always added.
 
 ```yaml
 spec:
@@ -1117,7 +1118,7 @@ spec:
           sandboxOrigin: "https://apps.openclaw.example.com"
 ```
 
-OpenClaw requires the sandbox origin to differ from the Control UI origin, so give it a dedicated hostname and route only that hostname to Service port `18795` with your own Ingress or HTTPRoute. If you set `mcp.apps.sandboxPort` yourself, your value wins; use `18795` unless you also expose your port with a custom sidecar, because the proxy only forwards to `18795`. With `spec.networking.service.ports` set, add the `mcp-apps` port (target port `18796`) to your list explicitly.
+OpenClaw requires the sandbox origin to differ from the Control UI origin, so give it a dedicated hostname and route only that hostname to Service port `18795` with your own Ingress or HTTPRoute. If you set `mcp.apps.sandboxPort` yourself, the proxy, the Service and the NetworkPolicy follow it. One exception: with `spec.config.configMapRef` and the gateway proxy disabled, the operator cannot read your port and the Service targets `18795`, so keep the default there. With `spec.networking.service.ports` set, add the `mcp-apps` port (target port `18796`, or your sandbox port when the proxy is disabled) to your list explicitly.
 
 ### CA bundle injection
 

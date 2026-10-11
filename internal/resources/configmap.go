@@ -114,7 +114,11 @@ func BuildConfigMapFromBytes(instance *openclawv1alpha1.OpenClawInstance, baseCo
 
 	// Only include nginx config when the gateway proxy is enabled
 	if IsGatewayProxyEnabled(instance) {
-		data[NginxConfigKey] = nginxStreamConfig()
+		var mcpAppsUpstream int32
+		if sandbox := ResolveMcpAppsSandbox(instance); sandbox.Exposed {
+			mcpAppsUpstream = mcpAppsListenPortFromConfig(configBytes, sandbox.ListenPort)
+		}
+		data[NginxConfigKey] = nginxStreamConfig(mcpAppsUpstream)
 	}
 
 	// Mesh provider ConfigMap keys, e.g. the Tailscale serve config the sidecar
@@ -515,18 +519,14 @@ func enrichConfigWithGatewayBind(configJSON []byte, instance *openclawv1alpha1.O
 // OpenClaw starts the sandbox listener on "gateway port plus one" by default.
 // With the gateway proxy sidecar enabled that port (18790) is GatewayProxyPort,
 // which nginx already holds on 0.0.0.0, so the listener fails with
-// "Address already in use" (#615). Pinning the port also gives the proxy
-// sidecar and the Service a fixed loopback target to forward to.
+// "Address already in use" (#615). The port is pinned with the proxy disabled
+// too, so the Service always has a known target port.
 //
 // The key is only written when mcp.apps.enabled is true so the config of
 // OpenClaw versions that predate MCP Apps is never touched. If the user has
-// already set mcp.apps.sandboxPort, or the gateway proxy is disabled (nothing
-// occupies gateway+1), the config is returned unchanged (user override wins).
-func enrichConfigWithMcpAppsSandboxPort(configJSON []byte, instance *openclawv1alpha1.OpenClawInstance) ([]byte, error) {
-	if !IsGatewayProxyEnabled(instance) {
-		return configJSON, nil
-	}
-
+// already set mcp.apps.sandboxPort the config is returned unchanged (user
+// override wins).
+func enrichConfigWithMcpAppsSandboxPort(configJSON []byte, _ *openclawv1alpha1.OpenClawInstance) ([]byte, error) {
 	var config map[string]interface{}
 	if err := json.Unmarshal(configJSON, &config); err != nil {
 		return configJSON, nil // not a JSON object, return unchanged
@@ -751,10 +751,20 @@ func enrichConfigWithSkillPacks(configJSON []byte, skillEntries map[string]inter
 	return json.Marshal(config)
 }
 
-// nginxStreamConfig returns the static nginx stream configuration for the
-// gateway reverse proxy sidecar. It proxies external traffic on dedicated
-// ports to the gateway and canvas processes listening on loopback.
-func nginxStreamConfig() string {
+// nginxStreamConfig returns the nginx stream configuration for the gateway
+// reverse proxy sidecar. It proxies external traffic on dedicated ports to the
+// gateway and canvas processes listening on loopback. When mcpAppsUpstream is
+// non-zero it also forwards McpAppsSandboxProxyPort to the MCP Apps sandbox
+// listener on that loopback port (#615).
+func nginxStreamConfig(mcpAppsUpstream int32) string {
+	mcpAppsServer := ""
+	if mcpAppsUpstream > 0 {
+		mcpAppsServer = fmt.Sprintf(`
+    server {
+        listen 0.0.0.0:%d;
+        proxy_pass 127.0.0.1:%d;
+    }`, McpAppsSandboxProxyPort, mcpAppsUpstream)
+	}
 	return fmt.Sprintf(`worker_processes 1;
 pid /tmp/nginx.pid;
 error_log /dev/stderr warn;
@@ -771,11 +781,7 @@ stream {
     server {
         listen 0.0.0.0:%d;
         proxy_pass 127.0.0.1:%d;
-    }
-    server {
-        listen 0.0.0.0:%d;
-        proxy_pass 127.0.0.1:%d;
-    }
+    }%s
 }
-`, GatewayProxyPort, GatewayPort, CanvasProxyPort, CanvasPort, McpAppsSandboxProxyPort, McpAppsSandboxPort)
+`, GatewayProxyPort, GatewayPort, CanvasProxyPort, CanvasPort, mcpAppsServer)
 }

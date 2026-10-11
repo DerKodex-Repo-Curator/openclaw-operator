@@ -286,13 +286,11 @@ func buildContainers(instance *openclawv1alpha1.OpenClawInstance, gatewayTokenSe
 }
 
 // buildMainContainerPorts returns the container ports for the main container.
-// Always includes gateway, canvas and the MCP Apps sandbox. The sandbox
-// listener only exists when mcp.apps.enabled is set in the OpenClaw config;
-// declaring the port is informational and harmless otherwise. The metrics
-// port is on the OTel Collector sidecar, not the main container.
+// Always includes gateway and canvas, plus the MCP Apps sandbox when it is
+// exposed (see ResolveMcpAppsSandbox). The metrics port is on the OTel
+// Collector sidecar, not the main container.
 func buildMainContainerPorts(instance *openclawv1alpha1.OpenClawInstance) []corev1.ContainerPort {
-	_ = instance // signature kept for consistency
-	return []corev1.ContainerPort{
+	ports := []corev1.ContainerPort{
 		{
 			Name:          "gateway",
 			ContainerPort: GatewayPort,
@@ -303,12 +301,15 @@ func buildMainContainerPorts(instance *openclawv1alpha1.OpenClawInstance) []core
 			ContainerPort: CanvasPort,
 			Protocol:      corev1.ProtocolTCP,
 		},
-		{
-			Name:          "mcp-apps",
-			ContainerPort: McpAppsSandboxPort,
-			Protocol:      corev1.ProtocolTCP,
-		},
 	}
+	if sandbox := ResolveMcpAppsSandbox(instance); sandbox.Exposed {
+		ports = append(ports, corev1.ContainerPort{
+			Name:          "mcp-apps",
+			ContainerPort: sandbox.ListenPort,
+			Protocol:      corev1.ProtocolTCP,
+		})
+	}
+	return ports
 }
 
 // buildMainContainer creates the main OpenClaw container
@@ -1946,27 +1947,31 @@ func buildTailscaleBinInitContainer(instance *openclawv1alpha1.OpenClawInstance)
 // buildGatewayProxyContainer creates the nginx reverse proxy sidecar that
 // exposes the loopback-bound gateway and canvas ports for external access.
 func buildGatewayProxyContainer(instance *openclawv1alpha1.OpenClawInstance) corev1.Container {
+	ports := []corev1.ContainerPort{
+		{
+			Name:          "gw-proxy",
+			ContainerPort: GatewayProxyPort,
+			Protocol:      corev1.ProtocolTCP,
+		},
+		{
+			Name:          "canvas-proxy",
+			ContainerPort: CanvasProxyPort,
+			Protocol:      corev1.ProtocolTCP,
+		},
+	}
+	// MCP Apps sandbox (#615), only when exposed.
+	if ResolveMcpAppsSandbox(instance).Exposed {
+		ports = append(ports, corev1.ContainerPort{
+			Name:          "mcp-apps-proxy",
+			ContainerPort: McpAppsSandboxProxyPort,
+			Protocol:      corev1.ProtocolTCP,
+		})
+	}
 	return corev1.Container{
 		Name:            "gateway-proxy",
 		Image:           GetGatewayProxyImage(instance),
 		ImagePullPolicy: corev1.PullIfNotPresent,
-		Ports: []corev1.ContainerPort{
-			{
-				Name:          "gw-proxy",
-				ContainerPort: GatewayProxyPort,
-				Protocol:      corev1.ProtocolTCP,
-			},
-			{
-				Name:          "canvas-proxy",
-				ContainerPort: CanvasProxyPort,
-				Protocol:      corev1.ProtocolTCP,
-			},
-			{
-				Name:          "mcp-apps-proxy",
-				ContainerPort: McpAppsSandboxProxyPort,
-				Protocol:      corev1.ProtocolTCP,
-			},
-		},
+		Ports:           ports,
 		VolumeMounts: []corev1.VolumeMount{
 			{
 				Name:      "config",
