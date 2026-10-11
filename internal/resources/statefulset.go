@@ -1618,6 +1618,35 @@ echo "data volume root ownership changed: $have -> $want"`, uid, gid)
 	}
 }
 
+// uvInitScript is the init-uv shell script. See buildUvInitContainer.
+const uvInitScript = `set -e
+mkdir -p /data/.local/bin /data/.cache /data/.config /data/skills
+f=/data/.local/bin/uv
+if [ -L "$f" ]; then
+  link=$(readlink "$f")
+  # Map gateway mount points back to /data. Relative targets resolve
+  # against the link's directory, which is the same in both containers.
+  case "$link" in
+    /home/openclaw/.local/*) target="/data/.local/${link#/home/openclaw/.local/}" ;;
+    /home/openclaw/.openclaw/*) target="/data/${link#/home/openclaw/.openclaw/}" ;;
+    /*) target="$link" ;;
+    *) target="/data/.local/bin/$link" ;;
+  esac
+  if [ -e "$target" ] || [ -L "$target" ]; then
+    echo "uv already installed (symlink to $link)"
+    exit 0
+  fi
+  echo "replacing dangling uv symlink (target $link does not exist)"
+  rm -f "$f"
+elif [ -x "$f" ]; then
+  echo "uv already installed"
+  exit 0
+fi
+rm -f "$f.tmp"
+cp /usr/local/bin/uv "$f.tmp"
+mv -f "$f.tmp" "$f"
+echo "uv $("$f" --version) installed"`
+
 // buildUvInitContainer creates an init container that copies the uv binary from
 // the uv image into the PVC-backed ~/.local/bin/. This gives agents immediate
 // access to "uv pip install" for Python packages and "uv tool install" for CLI
@@ -1631,17 +1660,21 @@ echo "data volume root ownership changed: $have -> $want"`, uid, gid)
 // ownership is not applied (e.g. Rancher local-path-provisioner on Talos).
 // Every downstream container that mounts these paths via SubPath inherits the
 // correct ownership from the pre-created directory. See #448.
+//
+// ~/.local/bin/uv may be a symlink that a user or agent created from the
+// gateway container, for example to pin a newer uv under ~/.openclaw. Absolute
+// targets use gateway paths, which do not exist here, so a link that is valid
+// for the gateway would look dangling to this container. The script maps the
+// two gateway mount points back to /data before deciding: a link whose target
+// exists is kept, a link whose target is gone is replaced. The binary is
+// copied to a temporary file and renamed over the destination, so the script
+// never writes through a symlink and a dangling link cannot fail the pod
+// start. See #626.
 func buildUvInitContainer(instance *openclawv1alpha1.OpenClawInstance) corev1.Container {
-	script := `set -e
-mkdir -p /data/.local/bin /data/.cache /data/.config /data/skills
-if [ -x /data/.local/bin/uv ]; then echo "uv already installed"; exit 0; fi
-cp /usr/local/bin/uv /data/.local/bin/uv
-echo "uv $(/data/.local/bin/uv --version) installed"`
-
 	return corev1.Container{
 		Name:                     "init-uv",
 		Image:                    GetUVImage(instance),
-		Command:                  []string{"sh", "-c", script},
+		Command:                  []string{"sh", "-c", uvInitScript},
 		ImagePullPolicy:          corev1.PullIfNotPresent,
 		TerminationMessagePath:   corev1.TerminationMessagePathDefault,
 		TerminationMessagePolicy: corev1.TerminationMessageReadFile,
