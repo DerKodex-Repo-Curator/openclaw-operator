@@ -692,9 +692,10 @@ _Appears in:_
 | `allowedIngressCIDRs` _string array_ | AllowedIngressCIDRs is a list of CIDRs allowed to access this instance |  | Optional: \{\} <br /> |
 | `allowedIngressNamespaces` _string array_ | AllowedIngressNamespaces is a list of namespace names allowed to access this instance |  | Optional: \{\} <br /> |
 | `allowSameNamespaceIngress` _boolean_ | AllowSameNamespaceIngress allows application traffic from all pods in the instance namespace.<br />Disable this when application ingress is fully described by the explicit namespace or CIDR lists.<br />Metrics ingress is configured independently through networking.metricsIngress. | true | Optional: \{\} <br /> |
-| `allowedEgressCIDRs` _string array_ | AllowedEgressCIDRs is a list of CIDRs this instance can reach<br />Default allows all egress on port 443 for AI APIs |  | Optional: \{\} <br /> |
+| `allowedEgressCIDRs` _string array_ | AllowedEgressCIDRs is a list of CIDRs this instance can reach on all ports.<br />These permissions are additive to the other enabled egress rules. |  | Optional: \{\} <br /> |
 | `allowDNS` _boolean_ | AllowDNS allows DNS resolution (port 53) | true | Optional: \{\} <br /> |
-| `additionalEgress` _[NetworkPolicyEgressRule](https://kubernetes.io/docs/reference/generated/kubernetes-api/v1.31/#networkpolicyegressrule-v1-networking) array_ | AdditionalEgress appends custom egress rules to the default DNS + HTTPS rules.<br />Use this to allow traffic to cluster-internal services on non-standard ports. |  | Optional: \{\} <br /> |
+| `allowHTTPS` _boolean_ | AllowHTTPS allows TCP port 443 egress to any destination, including private addresses.<br />Set to false and use AdditionalEgress to allow HTTPS only to specific destinations. | true | Optional: \{\} <br /> |
+| `additionalEgress` _[NetworkPolicyEgressRule](https://kubernetes.io/docs/reference/generated/kubernetes-api/v1.31/#networkpolicyegressrule-v1-networking) array_ | AdditionalEgress appends custom egress rules to the enabled built-in rules.<br />Use this to allow specific destinations and ports, including HTTPS when AllowHTTPS is false. |  | Optional: \{\} <br /> |
 
 
 #### NetworkingSpec
@@ -1350,6 +1351,7 @@ _Appears in:_
 | Field | Description | Default | Validation |
 | --- | --- | --- | --- |
 | `persistence` _[PersistenceSpec](#persistencespec)_ | Persistence configures the PersistentVolumeClaim |  | Optional: \{\} <br /> |
+| `fixOwnership` _boolean_ | FixOwnership runs the operator-managed init-data-owner init container,<br />which chowns the root of the data volume to the gateway's effective UID<br />(container runAsUser override, otherwise pod runAsUser) and pod runAsGroup<br />when it is owned by someone else (typically root). Kubernetes only applies<br />fsGroup to a volume root, so on most PVCs the directory mounted at<br />~/.openclaw stays owned by root. OpenClaw >= 2026.9 tightens directory<br />modes on that path when it writes config and fails with<br />"EPERM: operation not permitted, fchmod" if the directory is not owned by<br />the gateway UID. The init container runs as root with only CAP_CHOWN and<br />exits immediately when ownership is already correct.<br />When unset, the init container runs unless the instance's namespace<br />enforces the "restricted" Pod Security Standard<br />(pod-security.kubernetes.io/enforce=restricted), which would reject a<br />root init container at admission. In such namespaces fix ownership out<br />of band instead. Set to true to always run it, or false to never run it.<br />Resolving the unset default requires the operator to read the Namespace;<br />if that read fails, reconciliation is retried without changing workloads. |  | Optional: \{\} <br /> |
 
 
 #### TailscaleImageSpec

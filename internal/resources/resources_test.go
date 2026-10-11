@@ -879,8 +879,8 @@ func TestBuildStatefulSet_ConfigVolume_RawConfig(t *testing.T) {
 
 	// Init container should copy config from ConfigMap to data volume
 	initContainers := sts.Spec.Template.Spec.InitContainers
-	if len(initContainers) != 5 {
-		t.Fatalf("expected 5 init containers (init-data-owner + init-config + init-uv + init-pip + init-plugin-runtime-deps), got %d", len(initContainers))
+	if len(initContainers) != 6 {
+		t.Fatalf("expected 6 init containers (init-data-owner + init-config + init-uv + init-pip + init-plugin-runtime-deps + init-tmp-dir), got %d", len(initContainers))
 	}
 	initC := initContainers[1]
 	if initC.Name != "init-config" {
@@ -924,8 +924,8 @@ func TestBuildStatefulSet_ConfigVolume_ConfigMapRef(t *testing.T) {
 	// The controller reads the external CM and writes enriched content into the
 	// operator-managed CM under "openclaw.json", so the init container always uses that key.
 	initContainers := sts.Spec.Template.Spec.InitContainers
-	if len(initContainers) != 5 {
-		t.Fatalf("expected 5 init containers (init-data-owner + init-config + init-uv + init-pip + init-plugin-runtime-deps), got %d", len(initContainers))
+	if len(initContainers) != 6 {
+		t.Fatalf("expected 6 init containers (init-data-owner + init-config + init-uv + init-pip + init-plugin-runtime-deps + init-tmp-dir), got %d", len(initContainers))
 	}
 	initC := initContainers[1]
 	assertVolumeMount(t, initC.VolumeMounts, "data", "/data")
@@ -959,8 +959,8 @@ func TestBuildStatefulSet_ConfigMapRef_DefaultKey(t *testing.T) {
 
 	// Init container should use "openclaw.json" (operator-managed key)
 	initContainers := sts.Spec.Template.Spec.InitContainers
-	if len(initContainers) != 5 {
-		t.Fatalf("expected 5 init containers (init-data-owner + init-config + init-uv + init-pip + init-plugin-runtime-deps), got %d", len(initContainers))
+	if len(initContainers) != 6 {
+		t.Fatalf("expected 6 init containers (init-data-owner + init-config + init-uv + init-pip + init-plugin-runtime-deps + init-tmp-dir), got %d", len(initContainers))
 	}
 	expectedPrefix := "cp /config/'openclaw.json' /data/openclaw.json"
 	if !strings.HasPrefix(initContainers[1].Command[2], expectedPrefix) {
@@ -983,9 +983,9 @@ func TestBuildStatefulSet_VanillaDeployment_HasInitContainer(t *testing.T) {
 
 	sts := BuildStatefulSet(instance, "", nil, nil, nil)
 
-	// Vanilla deployments get init-data-owner + init-config + init-uv + init-pip + init-plugin-runtime-deps
-	if len(sts.Spec.Template.Spec.InitContainers) != 5 {
-		t.Fatalf("expected 5 init containers for vanilla deployment, got %d", len(sts.Spec.Template.Spec.InitContainers))
+	// Vanilla deployments get init-data-owner + init-config + init-uv + init-pip + init-plugin-runtime-deps + init-tmp-dir
+	if len(sts.Spec.Template.Spec.InitContainers) != 6 {
+		t.Fatalf("expected 6 init containers for vanilla deployment, got %d", len(sts.Spec.Template.Spec.InitContainers))
 	}
 	if sts.Spec.Template.Spec.InitContainers[1].Name != "init-config" {
 		t.Errorf("init container name = %q, want %q", sts.Spec.Template.Spec.InitContainers[1].Name, "init-config")
@@ -2021,6 +2021,77 @@ func TestBuildNetworkPolicy_DNSDisabled(t *testing.T) {
 	httpsRule := np.Spec.Egress[0]
 	if len(httpsRule.Ports) != 1 || httpsRule.Ports[0].Port.IntValue() != 443 {
 		t.Error("single egress rule should be HTTPS port 443")
+	}
+}
+
+func TestBuildNetworkPolicy_AllowHTTPS(t *testing.T) {
+	for _, tt := range []struct {
+		name       string
+		allowHTTPS *bool
+		allowDNS   *bool
+		wantHTTPS  bool
+		wantRules  int
+	}{
+		{name: "omitted", wantHTTPS: true, wantRules: 2},
+		{name: "enabled", allowHTTPS: Ptr(true), wantHTTPS: true, wantRules: 2},
+		{name: "disabled", allowHTTPS: Ptr(false), wantRules: 1},
+		{name: "dns and https disabled", allowHTTPS: Ptr(false), allowDNS: Ptr(false), wantRules: 0},
+	} {
+		t.Run(tt.name, func(t *testing.T) {
+			instance := newTestInstance("np-https")
+			instance.Spec.Security.NetworkPolicy.AllowHTTPS = tt.allowHTTPS
+			instance.Spec.Security.NetworkPolicy.AllowDNS = tt.allowDNS
+			np := BuildNetworkPolicy(instance)
+			if len(np.Spec.Egress) != tt.wantRules {
+				t.Fatalf("egress rules = %d, want %d", len(np.Spec.Egress), tt.wantRules)
+			}
+			foundHTTPS := false
+			for _, rule := range np.Spec.Egress {
+				for _, port := range rule.Ports {
+					if port.Port != nil && port.Port.IntValue() == 443 &&
+						port.Protocol != nil && *port.Protocol == corev1.ProtocolTCP && len(rule.To) == 0 {
+						foundHTTPS = true
+					}
+				}
+			}
+			if foundHTTPS != tt.wantHTTPS {
+				t.Errorf("unrestricted TCP/443 rule present = %v, want %v", foundHTTPS, tt.wantHTTPS)
+			}
+			// An empty egress list must still enforce egress isolation.
+			if !equality.Semantic.DeepEqual(np.Spec.PolicyTypes, []networkingv1.PolicyType{
+				networkingv1.PolicyTypeIngress, networkingv1.PolicyTypeEgress,
+			}) {
+				t.Errorf("unexpected policy types: %v", np.Spec.PolicyTypes)
+			}
+		})
+	}
+}
+
+func TestBuildNetworkPolicy_HTTPSDisabledPreservesOtherRules(t *testing.T) {
+	instance := newTestInstance("np-restricted-https")
+	instance.Spec.SelfConfigure.Enabled = true
+	instance.Spec.Chromium.Enabled = true
+	instance.Spec.Tailscale.Enabled = true
+	instance.Spec.Security.NetworkPolicy.AllowedEgressCIDRs = []string{"10.20.0.0/16"}
+	instance.Spec.Security.NetworkPolicy.AdditionalEgress = []networkingv1.NetworkPolicyEgressRule{
+		{
+			To: []networkingv1.NetworkPolicyPeer{
+				{IPBlock: &networkingv1.IPBlock{CIDR: "192.0.2.10/32"}},
+			},
+			Ports: []networkingv1.NetworkPolicyPort{
+				{Protocol: Ptr(corev1.ProtocolTCP), Port: Ptr(intstr.FromInt(443))},
+			},
+		},
+	}
+
+	want := BuildNetworkPolicy(instance)
+	// Remove only the default HTTPS rule; DNS, API server, mesh, Chromium, CIDRs,
+	// custom destination-scoped HTTPS, and ingress must remain unchanged.
+	want.Spec.Egress = append(want.Spec.Egress[:1], want.Spec.Egress[2:]...)
+	instance.Spec.Security.NetworkPolicy.AllowHTTPS = Ptr(false)
+	got := BuildNetworkPolicy(instance)
+	if !equality.Semantic.DeepEqual(got, want) {
+		t.Errorf("disabling HTTPS changed other policy rules:\ngot: %+v\nwant: %+v", got.Spec, want.Spec)
 	}
 }
 
@@ -6899,7 +6970,9 @@ func TestBuildStatefulSet_WithPlugins_InitPluginsContainer(t *testing.T) {
 		t.Errorf("init-plugins NPM_CONFIG_CACHE = %q, want /home/openclaw/.cache/npm", envMap["NPM_CONFIG_CACHE"])
 	}
 
-	// Should have data, .local and .cache subpath mounts, plus plugins-tmp.
+	// The plugin installer uses the image's sticky /tmp. A Kubernetes emptyDir
+	// mounted there becomes 2777 under fsGroup and fails OpenClaw's secure
+	// temporary-workspace ancestry check.
 	// `data` is mounted at three different paths, so check (name, path)
 	// tuples explicitly rather than going through assertVolumeMount (which
 	// stops at the first name match).
@@ -6912,10 +6985,14 @@ func TestBuildStatefulSet_WithPlugins_InitPluginsContainer(t *testing.T) {
 		{"data", "/home/openclaw/.openclaw"},
 		{"data", "/home/openclaw/.local"},
 		{"data", "/home/openclaw/.cache"},
-		{"plugins-tmp", "/tmp"},
 	} {
 		if !have[want] {
 			t.Errorf("missing volume mount %s at %s", want.name, want.path)
+		}
+	}
+	for _, mount := range pluginsContainer.VolumeMounts {
+		if mount.MountPath == "/tmp" {
+			t.Error("init-plugins must not mask the image's sticky /tmp")
 		}
 	}
 
@@ -6999,17 +7076,14 @@ func TestBuildStatefulSet_WithPlugins_EnvAndEnvFromPropagated(t *testing.T) {
 	}
 }
 
-func TestBuildStatefulSet_WithPlugins_PluginsTmpVolume(t *testing.T) {
+func TestBuildStatefulSet_WithPlugins_NoPluginsTmpVolume(t *testing.T) {
 	instance := newTestInstance("plugins-vol")
 	instance.Spec.Plugins = []string{"some-plugin"}
 
 	sts := BuildStatefulSet(instance, "", nil, nil, nil)
 	pluginsTmpVol := findVolume(sts.Spec.Template.Spec.Volumes, "plugins-tmp")
-	if pluginsTmpVol == nil {
-		t.Fatal("plugins-tmp volume not found")
-	}
-	if pluginsTmpVol.EmptyDir == nil {
-		t.Error("plugins-tmp volume should be emptyDir")
+	if pluginsTmpVol != nil {
+		t.Error("plugins-tmp volume must not mask the image's sticky /tmp")
 	}
 }
 
@@ -7955,8 +8029,8 @@ func TestBuildStatefulSet_CustomInitContainers_AfterOperatorManaged(t *testing.T
 	sts := BuildStatefulSet(instance, "", nil, nil, nil)
 	initContainers := sts.Spec.Template.Spec.InitContainers
 
-	if len(initContainers) != 7 {
-		t.Fatalf("expected 7 init containers, got %d", len(initContainers))
+	if len(initContainers) != 8 {
+		t.Fatalf("expected 8 init containers, got %d", len(initContainers))
 	}
 	if initContainers[0].Name != "init-data-owner" {
 		t.Errorf("initContainers[0] = %q, want init-data-owner", initContainers[0].Name)
@@ -7976,8 +8050,11 @@ func TestBuildStatefulSet_CustomInitContainers_AfterOperatorManaged(t *testing.T
 	if initContainers[5].Name != "init-skills" {
 		t.Errorf("initContainers[5] = %q, want init-skills", initContainers[5].Name)
 	}
-	if initContainers[6].Name != "user-init" {
-		t.Errorf("initContainers[6] = %q, want user-init", initContainers[6].Name)
+	if initContainers[6].Name != "init-tmp-dir" {
+		t.Errorf("initContainers[6] = %q, want init-tmp-dir", initContainers[6].Name)
+	}
+	if initContainers[7].Name != "user-init" {
+		t.Errorf("initContainers[7] = %q, want user-init", initContainers[7].Name)
 	}
 }
 
@@ -8348,7 +8425,7 @@ func TestBuildStatefulSet_RuntimeDeps_InitContainerOrder(t *testing.T) {
 	sts := BuildStatefulSet(instance, "", nil, nil, nil)
 	initContainers := sts.Spec.Template.Spec.InitContainers
 
-	expected := []string{"init-data-owner", "init-config", "init-uv", "init-pip", "init-plugin-runtime-deps", "init-pnpm", "init-python", "init-skills", "user-init"}
+	expected := []string{"init-data-owner", "init-config", "init-uv", "init-pip", "init-plugin-runtime-deps", "init-pnpm", "init-python", "init-skills", "init-tmp-dir", "user-init"}
 	if len(initContainers) != len(expected) {
 		t.Fatalf("expected %d init containers, got %d: %v", len(expected), len(initContainers),
 			func() []string {

@@ -931,9 +931,19 @@ spec:
 
 Kubernetes applies `fsGroup` to the root of a volume but never changes its owner, so on most PVCs the directory mounted at `~/.openclaw` is owned by `root` with only the group set to the pod's GID. OpenClaw 2026.9 and later tighten directory modes on that path when they write `openclaw.json`, and `chmod` on a directory you do not own fails with `EPERM: operation not permitted, fchmod` even when you are in its group. Without a fix the gateway crash-loops after the upgrade and `openclaw doctor --fix` cannot complete.
 
-The operator therefore runs an `init-data-owner` init container first on every pod start. It runs as root with every capability dropped except `CHOWN`, changes the owner of the volume root to the pod's `runAsUser:runAsGroup` when it differs, and exits without touching anything when ownership is already correct. Children of the volume root are created by the pod UID and are never modified.
+The operator therefore runs an `init-data-owner` init container first on every pod start. It runs as root with every capability dropped except `CHOWN`, changes the owner of the volume root to the gateway's effective UID and the pod's `runAsGroup` when it differs, and exits without touching anything when ownership is already correct. The effective UID uses `security.containerSecurityContext.runAsUser` when set, otherwise the pod UID. Operator-managed init containers that write to the data volume use the same UID override, so they can access the directory after the gateway tightens its permissions. The ownership helper does not modify existing children; changing the runtime UID of an existing installation may require an out-of-band migration of those files. User-defined init containers retain their configured identities.
 
-If your cluster forbids root init containers (for example the `restricted` Pod Security Standard), disable it and fix ownership out of band once per PVC:
+Namespaces that enforce the `restricted` Pod Security Standard (`pod-security.kubernetes.io/enforce: restricted`) reject root init containers at admission. The operator detects that label and leaves `init-data-owner` out there automatically, so upgrading the operator never blocks pods in a restricted namespace. In those namespaces fix ownership out of band once per PVC (for example with a one-off Job in a namespace that permits it, or through your storage provisioner) before moving to OpenClaw 2026.9 or later.
+
+To detect the label the operator needs `get` on `namespaces` (granted by the Helm chart, the OLM bundle, and `config/rbac`). If it cannot read the instance's Namespace, it does not guess: reconciliation fails with a `ReconcileFailed` event naming the missing permission and is retried, without changing the existing StatefulSet. Setting `spec.storage.fixOwnership` explicitly skips the lookup.
+
+`spec.storage.fixOwnership` overrides the automatic behavior:
+
+| Value | Behavior |
+|-------|----------|
+| unset (default) | Run `init-data-owner`, except in namespaces that enforce the `restricted` Pod Security Standard |
+| `true` | Always run it (use when the namespace is exempted from Pod Security Admission some other way) |
+| `false` | Never run it (use when another admission policy forbids root init containers) |
 
 ```yaml
 spec:
@@ -1255,10 +1265,10 @@ The operator follows a **secure-by-default** philosophy. Every instance ships wi
 ### Defaults
 
 - **Non-root execution**: containers run as UID 1000; root (UID 0) is blocked by the validating webhook (exception: Ollama sidecar requires root per the official image)
-- **Read-only root filesystem**: enabled by default for the main container and the Chromium sidecar; the PVC at `~/.openclaw/` provides writable home, and a `/tmp` emptyDir handles temp files
+- **Read-only root filesystem**: enabled by default for the main container and the Chromium sidecar; the PVC at `~/.openclaw/` provides writable home, and a `/tmp` emptyDir handles temp files. The `init-tmp-dir` init container gives that `/tmp` the sticky bit (mode `1777`), which OpenClaw 2026.9.6 and later require before they create temporary workspaces; the root of an emptyDir is `2777` under `fsGroup` and cannot be changed from the pod spec
 - **All capabilities dropped**: no ambient Linux capabilities
 - **Seccomp RuntimeDefault**: syscall filtering enabled
-- **Default-deny NetworkPolicy**: only DNS (53) and HTTPS (443) egress allowed; ingress limited to same namespace. Metrics ingress is a separate rule that can be restricted independently -- see [Restricting who can scrape metrics](#restricting-who-can-scrape-metrics)
+- **Default-deny NetworkPolicy**: DNS (53) and HTTPS (443) egress allowed by default; set `security.networkPolicy.allowHTTPS: false` and use `additionalEgress` to restrict HTTPS destinations (see [Network Isolation](docs/architecture.md#network-isolation)). Ingress is limited to the same namespace. Metrics ingress is a separate rule that can be restricted independently -- see [Restricting who can scrape metrics](#restricting-who-can-scrape-metrics)
 - **Minimal RBAC**: each instance gets its own ServiceAccount with read-only access to its own ConfigMap; operator can create/update Secrets only for operator-managed gateway tokens
 - **No automatic token mounting**: `automountServiceAccountToken: false` on both ServiceAccounts and pod specs (enabled only when `selfConfigure` is active)
 - **Secret validation**: the operator checks that all referenced Secrets exist and sets a `SecretsReady` condition

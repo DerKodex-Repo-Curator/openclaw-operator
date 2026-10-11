@@ -660,8 +660,8 @@ type NetworkPolicySpec struct {
 	// +optional
 	AllowSameNamespaceIngress *bool `json:"allowSameNamespaceIngress,omitempty"`
 
-	// AllowedEgressCIDRs is a list of CIDRs this instance can reach
-	// Default allows all egress on port 443 for AI APIs
+	// AllowedEgressCIDRs is a list of CIDRs this instance can reach on all ports.
+	// These permissions are additive to the other enabled egress rules.
 	// +optional
 	AllowedEgressCIDRs []string `json:"allowedEgressCIDRs,omitempty"`
 
@@ -670,8 +670,14 @@ type NetworkPolicySpec struct {
 	// +optional
 	AllowDNS *bool `json:"allowDNS,omitempty"`
 
-	// AdditionalEgress appends custom egress rules to the default DNS + HTTPS rules.
-	// Use this to allow traffic to cluster-internal services on non-standard ports.
+	// AllowHTTPS allows TCP port 443 egress to any destination, including private addresses.
+	// Set to false and use AdditionalEgress to allow HTTPS only to specific destinations.
+	// +kubebuilder:default=true
+	// +optional
+	AllowHTTPS *bool `json:"allowHTTPS,omitempty"`
+
+	// AdditionalEgress appends custom egress rules to the enabled built-in rules.
+	// Use this to allow specific destinations and ports, including HTTPS when AllowHTTPS is false.
 	// +optional
 	AdditionalEgress []networkingv1.NetworkPolicyEgressRule `json:"additionalEgress,omitempty"`
 }
@@ -715,17 +721,23 @@ type StorageSpec struct {
 	Persistence PersistenceSpec `json:"persistence,omitempty"`
 
 	// FixOwnership runs the operator-managed init-data-owner init container,
-	// which chowns the root of the data volume to the pod's runAsUser:runAsGroup
+	// which chowns the root of the data volume to the gateway's effective UID
+	// (container runAsUser override, otherwise pod runAsUser) and pod runAsGroup
 	// when it is owned by someone else (typically root). Kubernetes only applies
 	// fsGroup to a volume root, so on most PVCs the directory mounted at
 	// ~/.openclaw stays owned by root. OpenClaw >= 2026.9 tightens directory
 	// modes on that path when it writes config and fails with
 	// "EPERM: operation not permitted, fchmod" if the directory is not owned by
-	// the pod UID. The init container runs as root with only CAP_CHOWN and
-	// exits immediately when ownership is already correct. Set to false on
-	// clusters that forbid root init containers (e.g. the "restricted" Pod
-	// Security Standard) and fix ownership out of band instead.
-	// +kubebuilder:default=true
+	// the gateway UID. The init container runs as root with only CAP_CHOWN and
+	// exits immediately when ownership is already correct.
+	//
+	// When unset, the init container runs unless the instance's namespace
+	// enforces the "restricted" Pod Security Standard
+	// (pod-security.kubernetes.io/enforce=restricted), which would reject a
+	// root init container at admission. In such namespaces fix ownership out
+	// of band instead. Set to true to always run it, or false to never run it.
+	// Resolving the unset default requires the operator to read the Namespace;
+	// if that read fails, reconciliation is retried without changing workloads.
 	// +optional
 	FixOwnership *bool `json:"fixOwnership,omitempty"`
 }

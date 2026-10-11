@@ -345,9 +345,12 @@ func buildMainContainer(instance *openclawv1alpha1.OpenClawInstance, gatewayToke
 				MountPath: "/home/openclaw/.config",
 				SubPath:   ".config",
 			},
+			// Mounted through a subdirectory that init-tmp-dir creates with the
+			// sticky bit. See buildTmpDirInitContainer.
 			{
 				Name:      "tmp",
 				MountPath: "/tmp",
+				SubPath:   MainTmpSubPath,
 			},
 		},
 	}
@@ -546,7 +549,7 @@ func buildInitContainers(instance *openclawv1alpha1.OpenClawInstance, externalWo
 	var initContainers []corev1.Container
 
 	// Data volume ownership fix. Runs first so every later init container and
-	// the main container see a data root owned by the pod UID. See #607.
+	// the main container see a data root owned by the gateway UID. See #607.
 	if IsDataOwnershipFixEnabled(instance) {
 		initContainers = append(initContainers, buildDataOwnerInitContainer(instance))
 	}
@@ -653,6 +656,35 @@ func buildInitContainers(instance *openclawv1alpha1.OpenClawInstance, externalWo
 	if pluginsContainer := buildPluginsInitContainer(instance); pluginsContainer != nil {
 		initContainers = append(initContainers, *pluginsContainer)
 	}
+
+	// Data writers must share the gateway UID: after OpenClaw tightens the
+	// data directory to 0700, the pod UID may no longer be able to traverse it.
+	// Only propagate identity, preserving each helper's own privilege settings.
+	// Explicit helper identities (notably init-data-owner's root UID) and
+	// user-supplied init containers must keep their existing security contexts.
+	mainSC := buildContainerSecurityContext(instance)
+	if mainSC.RunAsUser != nil {
+		for i := range initContainers {
+			c := &initContainers[i]
+			if c.SecurityContext != nil && c.SecurityContext.RunAsUser != nil {
+				continue
+			}
+			for _, mount := range c.VolumeMounts {
+				if mount.Name == "data" && !mount.ReadOnly {
+					if c.SecurityContext == nil {
+						c.SecurityContext = &corev1.SecurityContext{}
+					}
+					c.SecurityContext.RunAsUser = mainSC.RunAsUser
+					c.SecurityContext.RunAsNonRoot = mainSC.RunAsNonRoot
+					break
+				}
+			}
+		}
+	}
+
+	// Sticky /tmp for the main container. Always present: the main container
+	// mounts the subdirectory this creates.
+	initContainers = append(initContainers, buildTmpDirInitContainer(instance))
 
 	// Ollama model-pulling init container (only if enabled and models are specified)
 	if instance.Spec.Ollama.Enabled && len(instance.Spec.Ollama.Models) > 0 {
@@ -1409,7 +1441,6 @@ func buildPluginsInitContainer(instance *openclawv1alpha1.OpenClawInstance) *cor
 		{Name: "data", MountPath: "/home/openclaw/.openclaw"},
 		{Name: "data", MountPath: "/home/openclaw/.local", SubPath: ".local"},
 		{Name: "data", MountPath: "/home/openclaw/.cache", SubPath: ".cache"},
-		{Name: "plugins-tmp", MountPath: "/tmp"},
 	}
 
 	env := []corev1.EnvVar{
@@ -1528,12 +1559,78 @@ pnpm --version`
 	}
 }
 
+// TmpDirInitContainerName is the name of the init container that prepares the
+// main container's /tmp.
+const TmpDirInitContainerName = "init-tmp-dir"
+
+// MainTmpSubPath is the subdirectory of the "tmp" emptyDir that the main
+// container mounts at /tmp.
+const MainTmpSubPath = "tmp"
+
+// buildTmpDirInitContainer creates the init container that prepares a /tmp
+// with the sticky bit for the main container.
+//
+// The main container has a read-only root filesystem, so /tmp is an emptyDir.
+// With fsGroup set, the kubelet makes the root of an emptyDir group-owned by
+// fsGroup with mode 2777: world-writable, setgid, no sticky bit. OpenClaw
+// 2026.9.6 and later refuse to create a temporary workspace below such a
+// directory ("temp workspace ancestor is group/world writable without sticky
+// protection"). The startup doctor needs that workspace whenever it has to
+// install a configured plugin, so the gateway exits and the pod crash-loops.
+// #616 fixed the same check for init-plugins, which can use the image's own
+// /tmp because its root filesystem is writable.
+//
+// Nothing in the pod spec can set the mode of a volume root, and the pod UID
+// does not own it, so it cannot chmod it either. A directory the pod UID
+// creates inside the volume is its own, though. This container creates one
+// with mode 1777 and the main container mounts it via subPath, which hides the
+// 2777 volume root from the main container's path ancestry.
+//
+// It runs as the pod UID with no capabilities, so it is admitted under the
+// "restricted" Pod Security Standard.
+func buildTmpDirInitContainer(instance *openclawv1alpha1.OpenClawInstance) corev1.Container {
+	// chmod after mkdir: the setgid volume root and the umask both influence
+	// the mode mkdir produces, and a restart of the pod sandbox finds the
+	// directory already present.
+	script := fmt.Sprintf("set -e\nmkdir -p /tmp-volume/%[1]s\nchmod 1777 /tmp-volume/%[1]s", MainTmpSubPath)
+
+	// Run as the gateway's effective UID so the directory belongs to the user
+	// that writes to it (and so it matches the other operator init containers;
+	// see #619). Falls back to the pod UID when no container UID is set.
+	mainSC := buildContainerSecurityContext(instance)
+
+	return corev1.Container{
+		Name:                     TmpDirInitContainerName,
+		Image:                    ApplyRegistryOverride("docker.io/library/busybox:1.37", instance.Spec.Registry),
+		Command:                  []string{"sh", "-c", script},
+		ImagePullPolicy:          corev1.PullIfNotPresent,
+		TerminationMessagePath:   corev1.TerminationMessagePathDefault,
+		TerminationMessagePolicy: corev1.TerminationMessageReadFile,
+		Resources:                corev1.ResourceRequirements{},
+		SecurityContext: &corev1.SecurityContext{
+			AllowPrivilegeEscalation: Ptr(false),
+			ReadOnlyRootFilesystem:   Ptr(true),
+			RunAsUser:                mainSC.RunAsUser,
+			RunAsNonRoot:             Ptr(true),
+			Capabilities: &corev1.Capabilities{
+				Drop: []corev1.Capability{"ALL"},
+			},
+			SeccompProfile: &corev1.SeccompProfile{
+				Type: corev1.SeccompProfileTypeRuntimeDefault,
+			},
+		},
+		VolumeMounts: []corev1.VolumeMount{
+			{Name: "tmp", MountPath: "/tmp-volume"},
+		},
+	}
+}
+
 // DataOwnerInitContainerName is the name of the init container that fixes
 // ownership of the data volume root.
 const DataOwnerInitContainerName = "init-data-owner"
 
 // buildDataOwnerInitContainer creates an init container that chowns the root
-// of the data volume to the pod's runAsUser:runAsGroup when it is owned by
+// of the data volume to the gateway's effective UID and pod GID when it is owned by
 // someone else.
 //
 // Kubernetes applies fsGroup to the volume root (group + setgid bit) but never
@@ -1547,8 +1644,8 @@ const DataOwnerInitContainerName = "init-data-owner"
 // class of problem for every init container.
 //
 // The container runs as root with all capabilities dropped except CHOWN,
-// touches only the volume root (children are already created by the pod
-// UID), and exits without changes when ownership is already correct. It can
+// touches only the volume root (existing children are never migrated), and
+// exits without changes when ownership is already correct. It can
 // be disabled with spec.storage.fixOwnership=false.
 func buildDataOwnerInitContainer(instance *openclawv1alpha1.OpenClawInstance) corev1.Container {
 	psc := buildPodSecurityContext(instance)
@@ -1559,6 +1656,9 @@ func buildDataOwnerInitContainer(instance *openclawv1alpha1.OpenClawInstance) co
 	}
 	if psc.RunAsGroup != nil {
 		gid = *psc.RunAsGroup
+	}
+	if sc := buildContainerSecurityContext(instance); sc.RunAsUser != nil {
+		uid = *sc.RunAsUser
 	}
 
 	script := fmt.Sprintf(`set -e
@@ -2609,16 +2709,6 @@ func buildVolumes(instance *openclawv1alpha1.OpenClawInstance, skillPacks *Resol
 	if len(instance.Spec.Skills) > 0 || hasWorkspaceSkills(instance) {
 		volumes = append(volumes, corev1.Volume{
 			Name: "skills-tmp",
-			VolumeSource: corev1.VolumeSource{
-				EmptyDir: &corev1.EmptyDirVolumeSource{},
-			},
-		})
-	}
-
-	// Plugins-tmp volume for plugins init container
-	if len(instance.Spec.Plugins) > 0 {
-		volumes = append(volumes, corev1.Volume{
-			Name: "plugins-tmp",
 			VolumeSource: corev1.VolumeSource{
 				EmptyDir: &corev1.EmptyDirVolumeSource{},
 			},
