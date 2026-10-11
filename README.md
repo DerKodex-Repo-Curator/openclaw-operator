@@ -700,6 +700,49 @@ The initial implementation supports `https://registry.npmjs.org` with same-origi
 
 Obtain candidate metadata with `npm view <package>@<exact-version> dist.integrity`, review the artifact and capabilities, and commit version/digest changes together. The installer never replaces the committed digest with a newly discovered value. See [installer tests](test/installer/README.md) for reproducible failure cases and real-image compatibility testing.
 
+### Plugin installer controls
+
+`spec.pluginInstall` applies to both `spec.plugins` and `spec.verifiedPlugins`.
+Its resources support requests and limits; resource claims are rejected during
+API validation because the operator does not provision pod resource claims.
+Defaults preserve the existing installer behavior. To keep runtime environment
+secrets out of the installer, bound its resources, and use a read-only image:
+
+```yaml
+spec:
+  pluginInstall:
+    inheritEnv: false
+    readOnlyRootFilesystem: true
+    resources:
+      requests:
+        cpu: 25m
+        memory: 256Mi
+        ephemeral-storage: 64Mi
+      limits:
+        memory: 1Gi
+        ephemeral-storage: 128Mi
+```
+
+`inheritEnv: false` excludes both `spec.env` and `spec.envFrom` from the installer;
+it does not change the gateway environment. The operator still supplies HOME,
+npm paths, lifecycle-script suppression, and a configured CA bundle. This is
+environment isolation, not a sandbox: the installer still mounts persistent
+OpenClaw state and uses the pod network.
+
+The installer and scratch initializer use the gateway's effective UID for file
+ownership, but retain the pod-level `runAsNonRoot` policy. A gateway-only
+`containerSecurityContext.runAsNonRoot` override does not change that policy.
+
+Read-only mode adds `init-plugin-scratch`, using the same runtime image and
+resource limits, without runtime environment variables. It creates a directory
+owned by the installer UID with mode `0700` inside an emptyDir; only that
+subdirectory is mounted at `/tmp` in `init-plugins`. Mounting the entire emptyDir
+would expose its fsGroup-adjusted `2777` root, which newer OpenClaw versions
+reject. The scratch volume is bounded by the configured ephemeral-storage limit
+(or `128Mi` if unset) and disappears with the pod. npm prefix/cache and plugin
+state remain writable on the data PVC. Custom runtime images or plugins may
+require additional writable paths; validate them before enabling read-only mode.
+
 ### Workspace seeding
 
 Pre-populate the agent workspace with files and directories before the agent starts. Files can be provided inline or referenced from an external ConfigMap -- ideal for GitOps workflows where workspace content is managed alongside your manifests.
@@ -1263,7 +1306,7 @@ The operator follows a **secure-by-default** philosophy. Every instance ships wi
 ### Defaults
 
 - **Non-root execution**: containers run as UID 1000; root (UID 0) is blocked by the validating webhook (exception: Ollama sidecar requires root per the official image)
-- **Read-only root filesystem**: enabled by default for the main container and the Chromium sidecar; the PVC at `~/.openclaw/` provides writable home, and a `/tmp` emptyDir handles temp files
+- **Read-only root filesystem**: enabled by default for the main container and the Chromium sidecar; the PVC at `~/.openclaw/` provides writable home, and a `/tmp` emptyDir handles temp files. The `init-tmp-dir` init container gives that `/tmp` the sticky bit (mode `1777`), which OpenClaw 2026.9.6 and later require before they create temporary workspaces; the root of an emptyDir is `2777` under `fsGroup` and cannot be changed from the pod spec
 - **All capabilities dropped**: no ambient Linux capabilities
 - **Seccomp RuntimeDefault**: syscall filtering enabled
 - **Default-deny NetworkPolicy**: DNS (53) and HTTPS (443) egress allowed by default; set `security.networkPolicy.allowHTTPS: false` and use `additionalEgress` to restrict HTTPS destinations (see [Network Isolation](docs/architecture.md#network-isolation)). Ingress is limited to the same namespace. Metrics ingress is a separate rule that can be restricted independently -- see [Restricting who can scrape metrics](#restricting-who-can-scrape-metrics)
