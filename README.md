@@ -514,7 +514,7 @@ Use a reusable, ephemeral setup key from the NetBird dashboard. The operator inj
 
 The sidecar runs in **netstack (userspace) mode**, so it keeps the same Restricted PSS posture as every other container the operator builds: all capabilities dropped, read-only root filesystem, non-root, seccomp `RuntimeDefault`. A kernel-mode peer would need `NET_ADMIN` and `/dev/net/tun`, which is a different security decision than this operator makes by default.
 
-Peer state lives on an emptyDir, so the peer re-enrolls on restart (which a reusable setup key handles). Unlike Tailscale, NetBird needs no Kubernetes API access, so no ServiceAccount token is mounted and no state Secret is created.
+Peer state lives on an emptyDir, so the peer re-enrolls on restart (which a reusable setup key handles). The sidecar keeps the root filesystem read-only: its config, peer state, daemon socket (`NB_DAEMON_ADDR`) and log file (`NB_LOG_FILE`) all live on that emptyDir at `/tmp/netbird`. Unlike Tailscale, NetBird needs no Kubernetes API access, so no ServiceAccount token is mounted and no state Secret is created.
 
 **Mesh providers are mutually exclusive.** Enabling both `tailscale` and `netbird` is rejected by the validating webhook: two overlay clients in one pod would race for the same egress rules and the agent's routing.
 
