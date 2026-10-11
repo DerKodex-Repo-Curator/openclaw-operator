@@ -729,6 +729,8 @@ type StorageSpec struct {
 	// (pod-security.kubernetes.io/enforce=restricted), which would reject a
 	// root init container at admission. In such namespaces fix ownership out
 	// of band instead. Set to true to always run it, or false to never run it.
+	// Resolving the unset default requires the operator to read the Namespace;
+	// if that read fails, reconciliation is retried without changing workloads.
 	// +optional
 	FixOwnership *bool `json:"fixOwnership,omitempty"`
 }

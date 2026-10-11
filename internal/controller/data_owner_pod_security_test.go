@@ -17,6 +17,8 @@ limitations under the License.
 package controller
 
 import (
+	"context"
+	"errors"
 	"fmt"
 	"time"
 
@@ -28,6 +30,7 @@ import (
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/runtime"
 	"k8s.io/apimachinery/pkg/types"
+	"sigs.k8s.io/controller-runtime/pkg/client"
 
 	openclawv1alpha1 "github.com/paperclipinc/openclaw-operator/api/v1alpha1"
 	"github.com/paperclipinc/openclaw-operator/internal/resources"
@@ -122,4 +125,67 @@ var _ = Describe("init-data-owner and Pod Security Standards", func() {
 		Expect(stored.Spec.Storage.FixOwnership).To(BeNil(),
 			"the namespace-derived default must stay in memory so relabeling the namespace takes effect")
 	})
+
+	It("fails reconciliation without touching the StatefulSet when the namespace cannot be read", func() {
+		namespace := newNamespace("restricted")
+		Expect(initContainerNames(namespace, nil)).
+			NotTo(ContainElement(resources.DataOwnerInitContainerName))
+
+		stsKey := types.NamespacedName{Name: "data-owner", Namespace: namespace}
+		before := &appsv1.StatefulSet{}
+		Expect(k8sClient.Get(ctx, stsKey, before)).To(Succeed())
+
+		instance := &openclawv1alpha1.OpenClawInstance{}
+		Expect(k8sClient.Get(ctx, types.NamespacedName{Name: "data-owner", Namespace: namespace}, instance)).To(Succeed())
+
+		// A reconciler whose Namespace read fails, as with RBAC that predates
+		// the namespaces "get" rule, while workload writes would still succeed.
+		r := &OpenClawInstanceReconciler{
+			Client:            k8sClient,
+			Scheme:            k8sClient.Scheme(),
+			OperatorNamespace: "default",
+			APIReader:         failingNamespaceReader{Reader: k8sClient},
+		}
+		err := r.reconcileResources(ctx, instance)
+		Expect(err).To(HaveOccurred())
+		Expect(err.Error()).To(ContainSubstring("spec.storage.fixOwnership"))
+		Expect(errors.Is(err, errNamespaceForbidden)).To(BeTrue())
+
+		after := &appsv1.StatefulSet{}
+		Expect(k8sClient.Get(ctx, stsKey, after)).To(Succeed())
+		Expect(after.ResourceVersion).To(Equal(before.ResourceVersion))
+		names := make([]string, 0, len(after.Spec.Template.Spec.InitContainers))
+		for _, c := range after.Spec.Template.Spec.InitContainers {
+			names = append(names, c.Name)
+		}
+		Expect(names).NotTo(ContainElement(resources.DataOwnerInitContainerName))
+	})
+
+	It("skips the namespace lookup when fixOwnership is set explicitly", func() {
+		r := &OpenClawInstanceReconciler{APIReader: failingNamespaceReader{Reader: k8sClient}}
+		for _, v := range []bool{true, false} {
+			instance := &openclawv1alpha1.OpenClawInstance{
+				ObjectMeta: metav1.ObjectMeta{Name: "explicit", Namespace: "unreadable"},
+				Spec: openclawv1alpha1.OpenClawInstanceSpec{
+					Storage: openclawv1alpha1.StorageSpec{FixOwnership: resources.Ptr(v)},
+				},
+			}
+			Expect(r.applyNamespaceDefaults(ctx, instance)).To(Succeed())
+			Expect(*instance.Spec.Storage.FixOwnership).To(Equal(v))
+		}
+	})
 })
+
+var errNamespaceForbidden = errors.New("namespaces is forbidden")
+
+// failingNamespaceReader fails every Namespace read and delegates the rest.
+type failingNamespaceReader struct {
+	client.Reader
+}
+
+func (f failingNamespaceReader) Get(ctx context.Context, key client.ObjectKey, obj client.Object, opts ...client.GetOption) error {
+	if _, ok := obj.(*corev1.Namespace); ok {
+		return errNamespaceForbidden
+	}
+	return f.Reader.Get(ctx, key, obj, opts...)
+}

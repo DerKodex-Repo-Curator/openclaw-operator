@@ -935,6 +935,8 @@ The operator therefore runs an `init-data-owner` init container first on every p
 
 Namespaces that enforce the `restricted` Pod Security Standard (`pod-security.kubernetes.io/enforce: restricted`) reject root init containers at admission. The operator detects that label and leaves `init-data-owner` out there automatically, so upgrading the operator never blocks pods in a restricted namespace. In those namespaces fix ownership out of band once per PVC (for example with a one-off Job in a namespace that permits it, or through your storage provisioner) before moving to OpenClaw 2026.9 or later.
 
+To detect the label the operator needs `get` on `namespaces` (granted by the Helm chart, the OLM bundle, and `config/rbac`). If it cannot read the instance's Namespace, it does not guess: reconciliation fails with a `ReconcileFailed` event naming the missing permission and is retried, without changing the existing StatefulSet. Setting `spec.storage.fixOwnership` explicitly skips the lookup.
+
 `spec.storage.fixOwnership` overrides the automatic behavior:
 
 | Value | Behavior |
